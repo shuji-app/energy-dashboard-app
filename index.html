@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>エネルギー管理ダッシュボード</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0f172a">
+<link rel="icon" href="icons/icon-192.png">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:#f1f5f9; font-family:'Hiragino Sans','Hiragino Kaku Gothic ProN',Meiryo,sans-serif; color:#0f172a; }
+  #root { min-height:100vh; }
+  #loading {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:12px; background:#f1f5f9; z-index:9999;
+  }
+  #loading.hide { display:none; }
+  #err { color:#b91c1c; font-size:13px; max-width:90%; white-space:pre-wrap; display:none; }
+</style>
+</head>
+<body>
+<div id="loading">
+  <div>読み込み中…</div>
+  <div id="err"></div>
+</div>
+<div id="root"></div>
+
+<!-- React / ReactDOM 本番ビルド（バージョン固定） -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+
+<!-- グラフ描画（バージョン固定） -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" crossorigin="anonymous"></script>
+
+<!-- Excel再取込用（バージョン固定） -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" crossorigin="anonymous"></script>
+
+<!-- Firebase（複数端末間のリアルタイム共有・バージョン固定。未設定時は読み込み失敗してもローカル動作にフォールバック） -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+
+<!-- 初期データ（エネルギー.xlsxから抽出済み。以後はアプリ内の「データ更新」で上書き可能） -->
+<script src="data/energy-data.js"></script>
+<script src="data/holidays.js"></script>
+
+<script>
+  var loadTimeout = setTimeout(function () {
+    document.getElementById("err").style.display = "block";
+    document.getElementById("err").textContent =
+      "読み込みに時間がかかっています。ネットワーク接続、または外部CDN（cdnjs.cloudflare.com）がブロックされていないかご確認ください。";
+  }, 8000);
+  window.addEventListener("error", function (e) {
+    var el = document.getElementById("err");
+    el.style.display = "block";
+    el.textContent = "エラーが発生しました：\n" + (e.message || e);
+  });
+</script>
+
+<!-- アプリ本体（事前にプレーンJSへ変換済み。ブラウザ側でBabelは使いません） -->
+<script src="app.compiled.js"></script>
+
+<script>
+  clearTimeout(loadTimeout);
+  var l = document.getElementById("loading");
+  if (l) l.className = "hide";
+</script>
+
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () { /* オフライン化は失敗しても致命的ではない */ });
+    });
+  }
+</script>
+</body>
+</html>
