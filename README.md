@@ -108,12 +108,22 @@ node -e "require('@babel/core').transformSync(require('fs').readFileSync('app.js
    信頼できるメンバーだけがこのアカウント情報を知っている、という運用が前提です）。
    その上で、「ルール」タブに以下を貼り付けて「公開」：
    ```json
-   {"rules": {"energyData": {".read": "auth != null", ".write": "auth != null"}, "settings": {".read": "auth != null", ".write": "auth != null"}, "notes": {".read": "auth != null", ".write": "auth != null"}}}
+   {"rules": {"energyData": {".read": "auth != null", ".write": "auth != null"}, "settings": {".read": "auth != null", ".write": "auth != null"}, "notes": {".read": "auth != null", ".write": "auth != null"}, "monitorFilesMeta": {".read": "auth != null", ".write": "auth != null"}, "monitorFileBlobs": {".read": "auth != null", ".write": "auth != null"}}}
    ```
-   （リポジトリを非公開のまま・ローカルのみで使う等、外部に漏れる心配が無い場合は、従来の
-   `{".read": true, ".write": true}`のままでも動作します。ただしソースを公開する場合、
-   `firebaseConfig`の値も一緒に公開されるため、認証なしのルールのままだと誰でもデータベースを
-   読み書きできてしまいます。）
+   （リポジトリを非公開のまま・ローカルのみで使う等、外部に漏れる心配が無い場合は、
+   下記の認証なし版でも動作します。ただしソースを公開する場合、`firebaseConfig`の値も
+   一緒に公開されるため、認証なしのルールのままだと誰でもデータベースを読み書きできてしまいます。）
+   ```json
+   {"rules": {"energyData": {".read": true, ".write": true}, "settings": {".read": true, ".write": true}, "notes": {".read": true, ".write": true}, "monitorFilesMeta": {".read": true, ".write": true}, "monitorFileBlobs": {".read": true, ".write": true}}}
+   ```
+   **`monitorFilesMeta`/`monitorFileBlobs`は中央監視画面機能（後述）を使う場合に必要なパスです。
+   ルールに追加し忘れると`permission_denied`エラーになります。** 中央監視画面機能を使わない場合は
+   省略しても構いません。
+   - 中央監視画面（PDF/JPEG/PNG、後述）は**Firebase Storageではなく、このRealtime Database
+     （無料）にbase64文字列として保存**します。Firebase Storageは2024年10月以降に作成された
+     新規プロジェクトでは無料プラン（Spark）で使えなくなった（有料のBlazeプランへの
+     アップグレードが必須になった）ため、追加のコストなしで使える構成にしています。
+     1ファイルあたり8MBまでという制限を設けています（`MONITOR_FILE_MAX_BYTES`）。
 5. 「プロジェクトの設定」→「全般」→「マイアプリ」→ウェブアプリを追加（`</>`アイコン）→
    表示された`firebaseConfig`オブジェクトをコピー。
 6. `app.jsx`内の`firebaseConfig`定数（ファイル冒頭、`DEFAULT_CHARTS`の直後）に貼り付けて

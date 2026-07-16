@@ -232,6 +232,11 @@ if (fbApp) {
     console.warn("Firebase Auth初期化に失敗しました。", e);
   }
 }
+// 中央監視画面（PDF/JPEG/PNG）を他端末とも共有する場合は、Firebase Storageではなく
+// 既存のRealtime Database（無料枠）にbase64文字列として保存する
+// （Firebase Storageは2024年10月以降の新規プロジェクトでは無料プランで使えなくなったため）。
+// dbが使えるときだけ「同期あり」とし、そうでない場合はIndexedDBのみで完結する。
+const monitorSyncEnabled = !!db;
 
 // Firebaseへの書き込みは、状態の変化を監視するeffectではなく、実際にユーザーが保存操作をした
 // タイミング（各handle*関数）からのみ呼び出す。これにより「リモートの変更を受けて再度書き込む」
@@ -325,13 +330,19 @@ function withComputed(row, settings) {
 // 次回起動時にも同じファイルへ書き込み続けられるようにする。
 // ============================================================
 const IDB_NAME = "energyAppFS";
+const IDB_VERSION = 2;
 const IDB_STORE = "handles";
 const IDB_KEY = "autoSaveFile";
+const IDB_MONITOR_STORE = "monitorFiles";
 function idbOpen() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
     req.onupgradeneeded = () => {
-      req.result.createObjectStore(IDB_STORE);
+      const dbInst = req.result;
+      if (!dbInst.objectStoreNames.contains(IDB_STORE)) dbInst.createObjectStore(IDB_STORE);
+      if (!dbInst.objectStoreNames.contains(IDB_MONITOR_STORE)) dbInst.createObjectStore(IDB_MONITOR_STORE, {
+        keyPath: "date"
+      });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -363,6 +374,128 @@ async function idbClearHandle() {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+// 中央監視装置の熱源画面（PDF/JPEG/PNG）を日付ごとに保管する。この端末のIndexedDBのみに
+// 保存され、Firebase等では同期されない（1画面あたり数MBになり得るため、まずはローカル保存のみ）。
+async function idbSaveMonitorFile(dateStr, file) {
+  const dbInst = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readwrite");
+    tx.objectStore(IDB_MONITOR_STORE).put({
+      date: dateStr,
+      fileName: file.name,
+      fileType: file.type,
+      blob: file,
+      uploadedAt: Date.now()
+    });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbGetMonitorFile(dateStr) {
+  const dbInst = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readonly");
+    const req = tx.objectStore(IDB_MONITOR_STORE).get(dateStr);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbDeleteMonitorFile(dateStr) {
+  const dbInst = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readwrite");
+    tx.objectStore(IDB_MONITOR_STORE).delete(dateStr);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbListMonitorFiles() {
+  const dbInst = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readonly");
+    const req = tx.objectStore(IDB_MONITOR_STORE).getAll();
+    req.onsuccess = () => {
+      // 一覧表示ではblob本体は不要なので除いて返す（メモリ節約）
+      const list = (req.result || []).map(({
+        date,
+        fileName,
+        fileType,
+        uploadedAt
+      }) => ({
+        date,
+        fileName,
+        fileType,
+        uploadedAt
+      }));
+      resolve(list.sort((a, b) => a.date < b.date ? 1 : -1));
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Realtime Databaseへの書き込みが（ルール未設定等で）応答無しのままになることがあるため、
+// 一定時間で明示的にエラーとして扱う。
+function withTimeout(promise, ms, message) {
+  return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))]);
+}
+const MONITOR_FILE_MAX_BYTES = 8 * 1024 * 1024; // Realtime Databaseの無料枠を圧迫しすぎないよう8MBを目安に制限
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+// monitorSyncEnabled(=Realtime Databaseが使える)なら他端末とも共有される保存先
+// （Realtime Databaseにbase64文字列として保存）を使い、そうでなければこの端末の
+// IndexedDBだけで完結させる。呼び出し側（コンポーネント）はどちらが使われているか
+// 意識しなくてよいようにラップしている。
+async function monitorSaveFile(dateStr, file) {
+  if (monitorSyncEnabled) {
+    if (file.size > MONITOR_FILE_MAX_BYTES) {
+      throw new Error(`ファイルサイズが大きすぎます（${MONITOR_FILE_MAX_BYTES / 1024 / 1024}MB以下にしてください）。`);
+    }
+    const dataUrl = await fileToDataUrl(file);
+    await withTimeout(db.ref("monitorFileBlobs/" + dateStr).set(dataUrl), 15000, "保存がタイムアウトしました。Realtime Databaseのルールに monitorFileBlobs / monitorFilesMeta が含まれているかご確認ください。");
+    await db.ref("monitorFilesMeta/" + dateStr).set({
+      fileName: file.name,
+      fileType: file.type,
+      uploadedAt: Date.now()
+    });
+  } else {
+    await idbSaveMonitorFile(dateStr, file);
+  }
+}
+async function monitorDeleteFile(dateStr) {
+  if (monitorSyncEnabled) {
+    await db.ref("monitorFileBlobs/" + dateStr).remove();
+    await db.ref("monitorFilesMeta/" + dateStr).remove();
+  } else {
+    await idbDeleteMonitorFile(dateStr);
+  }
+}
+// プレビュー用のURLを返す。Firebase同期時はdata URL文字列（revoke不要）、
+// IndexedDB利用時はBlobから作ったオブジェクトURL（呼び出し側でrevoke必須）を返す。
+async function monitorGetPreviewSrc(dateStr) {
+  if (monitorSyncEnabled) {
+    const snap = await withTimeout(db.ref("monitorFileBlobs/" + dateStr).once("value"), 15000, "読み込みがタイムアウトしました。");
+    if (!snap.exists()) return null;
+    return {
+      url: snap.val(),
+      revoke: false
+    };
+  }
+  const rec = await idbGetMonitorFile(dateStr);
+  if (!rec) return null;
+  return {
+    url: URL.createObjectURL(rec.blob),
+    revoke: true
+  };
 }
 function loadInitialData() {
   try {
@@ -1649,7 +1782,9 @@ function DataEntryView({
   onSave,
   onDelete,
   notes,
-  onSaveNote
+  onSaveNote,
+  monitorFiles,
+  onDeleteMonitorFile
 }) {
   const dataByDate = useMemo(() => {
     const m = {};
@@ -1665,6 +1800,14 @@ function DataEntryView({
   const [selectedDate, setSelectedDate] = useState(latestDate || `${defaultYm}-01`);
   const [showNotesList, setShowNotesList] = useState(false);
   const [showMissingDays, setShowMissingDays] = useState(false);
+  const [showMonitorList, setShowMonitorList] = useState(false);
+  const [previewMonitorDate, setPreviewMonitorDate] = useState(null);
+  const monitorDateSet = useMemo(() => new Set(monitorFiles.map(f => f.date)), [monitorFiles]);
+  const previewMonitorMeta = previewMonitorDate ? monitorFiles.find(f => f.date === previewMonitorDate) : null;
+  const handleDeleteMonitorFile = dateStr => {
+    onDeleteMonitorFile(dateStr);
+    setPreviewMonitorDate(null);
+  };
   const missingDays = useMemo(() => {
     if (!data.length) return [];
     const known = new Set(data.map(r => r.date));
@@ -1725,7 +1868,10 @@ function DataEntryView({
   }, "\u672A\u5165\u529B\u65E5\u4E00\u89A7", missingDays.length > 0 && ` (${missingDays.length})`), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-small",
     onClick: () => setShowNotesList(true)
-  }, "\uD83D\uDCDD \u30E1\u30E2\u4E00\u89A7"))), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCDD \u30E1\u30E2\u4E00\u89A7"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: () => setShowMonitorList(true)
+  }, "\uD83D\uDDA5 \u4E2D\u592E\u76E3\u8996\u753B\u9762\u4E00\u89A7", monitorFiles.length > 0 && ` (${monitorFiles.length})`))), /*#__PURE__*/React.createElement("div", {
     className: "entry-cal-grid entry-cal-dow"
   }, ["日", "月", "火", "水", "木", "金", "土"].map(w => /*#__PURE__*/React.createElement("div", {
     key: w,
@@ -1739,6 +1885,7 @@ function DataEntryView({
     });
     const has = !!dataByDate[dateStr];
     const hasNote = !!(notes && notes[dateStr]);
+    const hasMonitor = monitorDateSet.has(dateStr);
     const day = Number(dateStr.split("-")[2]);
     const isSelected = dateStr === selectedDate;
     const dow = i % 7;
@@ -1748,7 +1895,14 @@ function DataEntryView({
       onClick: () => setSelectedDate(dateStr)
     }, /*#__PURE__*/React.createElement("span", {
       className: "entry-cal-day"
-    }, day), hasNote && /*#__PURE__*/React.createElement("span", {
+    }, day), hasMonitor && /*#__PURE__*/React.createElement("span", {
+      className: "entry-cal-monitor-icon",
+      title: "\u4E2D\u592E\u76E3\u8996\u753B\u9762\u3042\u308A\uFF08\u30AF\u30EA\u30C3\u30AF\u3067\u30D7\u30EC\u30D3\u30E5\u30FC\uFF09",
+      onClick: e => {
+        e.stopPropagation();
+        setPreviewMonitorDate(dateStr);
+      }
+    }, "\uD83D\uDDA5"), hasNote && /*#__PURE__*/React.createElement("span", {
       className: "entry-cal-note-icon",
       title: notes[dateStr]
     }, "\uD83D\uDCDD"), has && /*#__PURE__*/React.createElement("span", {
@@ -1766,7 +1920,9 @@ function DataEntryView({
     className: "entry-cal-dot standalone empty-dot"
   }), "\u672A\u5165\u529B"), /*#__PURE__*/React.createElement("span", {
     className: "legend-item"
-  }, "\uD83D\uDCDD \u30E1\u30E2\u3042\u308A"))), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCDD \u30E1\u30E2\u3042\u308A"), /*#__PURE__*/React.createElement("span", {
+    className: "legend-item"
+  }, "\uD83D\uDDA5 \u4E2D\u592E\u76E3\u8996\u753B\u9762\u3042\u308A"))), /*#__PURE__*/React.createElement("div", {
     className: "entry-form-panel"
   }, selectedDate ? /*#__PURE__*/React.createElement(DayEntryForm, {
     key: selectedDate,
@@ -1832,6 +1988,16 @@ function DataEntryView({
       setSelectedDate(dateStr);
       setShowMissingDays(false);
     }
+  }), showMonitorList && /*#__PURE__*/React.createElement(MonitorFilesListModal, {
+    files: monitorFiles,
+    onClose: () => setShowMonitorList(false),
+    onPreview: dateStr => setPreviewMonitorDate(dateStr),
+    onDelete: handleDeleteMonitorFile
+  }), previewMonitorDate && /*#__PURE__*/React.createElement(MonitorPreviewModal, {
+    date: previewMonitorDate,
+    fileMeta: previewMonitorMeta,
+    onClose: () => setPreviewMonitorDate(null),
+    onDelete: handleDeleteMonitorFile
   }));
 }
 function MissingDaysModal({
@@ -1894,6 +2060,207 @@ function NotesListModal({
     className: "btn btn-primary",
     onClick: onClose
   }, "\u9589\u3058\u308B"))));
+}
+const MONITOR_FILE_ACCEPT = ".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png";
+const MONITOR_FILE_TYPES = ["application/pdf", "image/jpeg", "image/jpg", "image/png"];
+function MonitorImportModal({
+  onClose,
+  defaultDate,
+  onUploaded
+}) {
+  const [date, setDate] = useState(defaultDate);
+  const [status, setStatus] = useState("");
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileRef = useRef(null);
+  const acceptFile = file => {
+    if (!file) return;
+    if (!MONITOR_FILE_TYPES.includes(file.type)) {
+      setStatus("PDF・JPEG・PNGのみアップロードできます。");
+      return;
+    }
+    setSelectedFile(file);
+    setStatus("");
+  };
+  const handleUpload = async () => {
+    if (!date) {
+      setStatus("対象日を選択してください。");
+      return;
+    }
+    if (!selectedFile) {
+      setStatus("ファイルを選択してください。");
+      return;
+    }
+    try {
+      await monitorSaveFile(date, selectedFile);
+      setStatus(`${date} に保存しました（データ入力画面のカレンダーからプレビューできます）。`);
+      setSelectedFile(null);
+      if (fileRef.current) fileRef.current.value = "";
+      onUploaded();
+    } catch (e) {
+      setStatus("保存エラー: " + e.message);
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "modal-backdrop",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal",
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h3", null, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\u53D6\u308A\u8FBC\u307F"), /*#__PURE__*/React.createElement("p", {
+    className: "modal-note"
+  }, "\u4E2D\u592E\u76E3\u8996\u88C5\u7F6E\u306E\u71B1\u6E90\u753B\u9762\uFF08PDF\u30FBJPEG\u30FBPNG\uFF09\u3092\u65E5\u4ED8\u3054\u3068\u306B\u53D6\u308A\u8FBC\u307F\u307E\u3059\u3002", monitorSyncEnabled ? "Firebaseに保存され、他端末とも共有されます。" : "この端末（ブラウザ）内にのみ保存されます。", "\u300C\u30C7\u30FC\u30BF\u5165\u529B\u300D\u753B\u9762\u306E\u30AB\u30EC\u30F3\u30C0\u30FC\u304B\u3089\u30D7\u30EC\u30D3\u30E5\u30FC\u3067\u304D\u307E\u3059\u3002"), /*#__PURE__*/React.createElement("div", {
+    className: "form-row"
+  }, /*#__PURE__*/React.createElement("label", null, "\u5BFE\u8C61\u65E5"), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: date,
+    onChange: e => setDate(e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-dropzone" + (dragOver ? " drag-over" : ""),
+    onClick: () => fileRef.current && fileRef.current.click(),
+    onDragOver: e => {
+      e.preventDefault();
+      setDragOver(true);
+    },
+    onDragLeave: () => setDragOver(false),
+    onDrop: e => {
+      e.preventDefault();
+      setDragOver(false);
+      acceptFile(e.dataTransfer.files && e.dataTransfer.files[0]);
+    }
+  }, selectedFile ? /*#__PURE__*/React.createElement("div", null, "\u9078\u629E\u4E2D\u306E\u30D5\u30A1\u30A4\u30EB: ", /*#__PURE__*/React.createElement("b", null, selectedFile.name)) : /*#__PURE__*/React.createElement("div", null, "\u3053\u3053\u306B\u30D5\u30A1\u30A4\u30EB\u3092\u30C9\u30E9\u30C3\u30B0\uFF06\u30C9\u30ED\u30C3\u30D7", /*#__PURE__*/React.createElement("br", null), "\u307E\u305F\u306F \u30AF\u30EA\u30C3\u30AF\u3057\u3066\u30D5\u30A1\u30A4\u30EB\u3092\u9078\u629E\uFF08PDF\u30FBJPEG\u30FBPNG\uFF09"), /*#__PURE__*/React.createElement("input", {
+    type: "file",
+    ref: fileRef,
+    accept: MONITOR_FILE_ACCEPT,
+    style: {
+      display: "none"
+    },
+    onChange: e => acceptFile(e.target.files[0])
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "modal-actions",
+    style: {
+      justifyContent: "flex-start"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    onClick: handleUpload
+  }, "\u4FDD\u5B58")), status && /*#__PURE__*/React.createElement("div", {
+    className: "modal-status"
+  }, status), /*#__PURE__*/React.createElement("div", {
+    className: "modal-actions"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: onClose
+  }, "\u9589\u3058\u308B"))));
+}
+function MonitorFilesListModal({
+  files,
+  onClose,
+  onPreview,
+  onDelete
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    className: "modal-backdrop",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal",
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h3", null, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\u4E00\u89A7"), files.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "analysis-empty"
+  }, "\u307E\u3060\u53D6\u308A\u8FBC\u307E\u308C\u305F\u753B\u9762\u304C\u3042\u308A\u307E\u305B\u3093\u3002") : /*#__PURE__*/React.createElement("div", {
+    className: "notes-list"
+  }, files.map(f => /*#__PURE__*/React.createElement("div", {
+    key: f.date,
+    className: "notes-list-item monitor-list-item"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "notes-list-date"
+  }, f.date), /*#__PURE__*/React.createElement("div", {
+    className: "notes-list-text"
+  }, f.fileName)), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-list-actions"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: () => onPreview(f.date)
+  }, "\u30D7\u30EC\u30D3\u30E5\u30FC"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small btn-ghost-red",
+    onClick: () => onDelete(f.date)
+  }, "\u524A\u9664"))))), /*#__PURE__*/React.createElement("div", {
+    className: "modal-actions"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    onClick: onClose
+  }, "\u9589\u3058\u308B"))));
+}
+function MonitorPreviewModal({
+  date,
+  fileMeta,
+  onClose,
+  onDelete
+}) {
+  const [url, setUrl] = useState(null);
+  const [status, setStatus] = useState("読み込み中…");
+  useEffect(() => {
+    let cancelled = false;
+    let revokeUrl = null;
+    setUrl(null);
+    setStatus("読み込み中…");
+    monitorGetPreviewSrc(date).then(result => {
+      if (cancelled) return;
+      if (!result) {
+        setStatus("見つかりませんでした。");
+        return;
+      }
+      setUrl(result.url);
+      if (result.revoke) revokeUrl = result.url;
+      setStatus("");
+    }).catch(e => {
+      if (!cancelled) setStatus("読み込みエラー: " + e.message);
+    });
+    return () => {
+      cancelled = true;
+      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+    };
+  }, [date]);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "modal-backdrop",
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fullscreen-modal",
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fullscreen-modal-header"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "panel-title"
+  }, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\uFF1A", date, fileMeta ? `（${fileMeta.fileName}）` : ""), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, url && fileMeta && /*#__PURE__*/React.createElement("a", {
+    className: "btn",
+    href: url,
+    download: fileMeta.fileName,
+    target: "_blank",
+    rel: "noreferrer"
+  }, "\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9"), fileMeta && /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost-red",
+    onClick: () => onDelete(date)
+  }, "\u524A\u9664"), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: onClose
+  }, "\u9589\u3058\u308B \u2715"))), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-body"
+  }, status && /*#__PURE__*/React.createElement("div", {
+    className: "analysis-empty"
+  }, status), url && fileMeta && fileMeta.fileType === "application/pdf" && /*#__PURE__*/React.createElement("iframe", {
+    src: url,
+    className: "monitor-preview-frame",
+    title: `${date}の中央監視画面`
+  }), url && fileMeta && fileMeta.fileType !== "application/pdf" && /*#__PURE__*/React.createElement("img", {
+    src: url,
+    className: "monitor-preview-image",
+    alt: `${date}の中央監視画面`
+  }))));
 }
 
 // ============================================================
@@ -2967,6 +3334,36 @@ function App() {
     return () => ref.off("value", handler);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const [showMonitorImport, setShowMonitorImport] = useState(false);
+  const [monitorFiles, setMonitorFiles] = useState([]);
+  const [monitorTick, setMonitorTick] = useState(0);
+
+  // 中央監視画面の一覧：Firebase同期が有効ならリアルタイム購読、そうでなければ
+  // IndexedDBから読み込む（monitorTickが変わるたびに再読み込み）。
+  useEffect(() => {
+    if (monitorSyncEnabled) {
+      const ref = db.ref("monitorFilesMeta");
+      const handler = snap => {
+        const obj = snap.val() || {};
+        const list = Object.entries(obj).map(([dateKey, meta]) => ({
+          date: dateKey,
+          ...meta
+        })).sort((a, b) => a.date < b.date ? 1 : -1);
+        setMonitorFiles(list);
+      };
+      ref.on("value", handler);
+      return () => ref.off("value", handler);
+    }
+    idbListMonitorFiles().then(setMonitorFiles).catch(() => {});
+  }, [monitorTick]);
+  const handleUploadedMonitorFile = () => {
+    if (!monitorSyncEnabled) setMonitorTick(t => t + 1);
+  };
+  const handleDeleteMonitorFile = dateStr => {
+    monitorDeleteFile(dateStr).then(() => {
+      if (!monitorSyncEnabled) setMonitorTick(t => t + 1);
+    });
+  };
   const savedViewState = useState(loadViewState)[0];
   const [view, setView] = useState(() => savedViewState && savedViewState.view !== "year" && savedViewState.view || "day");
   const [charts, setCharts] = useState(() => savedViewState && savedViewState.charts && savedViewState.charts.length ? savedViewState.charts : DEFAULT_CHARTS);
@@ -3460,6 +3857,9 @@ function App() {
     onClick: () => setShowDataUpdate(true)
   }, "\u30C7\u30FC\u30BF\u66F4\u65B0"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-ghost",
+    onClick: () => setShowMonitorImport(true)
+  }, "\uD83D\uDDA5 \u4E2D\u592E\u76E3\u8996\u753B\u9762\u53D6\u308A\u8FBC\u307F"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
     onClick: () => setShowReportPreview(true),
     title: "\u5370\u5237/PDF\u4FDD\u5B58\u524D\u306B\u30EC\u30DD\u30FC\u30C8\u306E\u30D7\u30EC\u30D3\u30E5\u30FC\u3092\u8868\u793A\u3057\u307E\u3059"
   }, "\u30EC\u30DD\u30FC\u30C8\u4F5C\u6210(PDF)"), /*#__PURE__*/React.createElement("button", {
@@ -3473,7 +3873,9 @@ function App() {
     onSave: handleSaveRecord,
     onDelete: handleDeleteRecord,
     notes: notes,
-    onSaveNote: handleSaveNote
+    onSaveNote: handleSaveNote,
+    monitorFiles: monitorFiles,
+    onDeleteMonitorFile: handleDeleteMonitorFile
   }), mode === "analysis" && (data.length ? /*#__PURE__*/React.createElement(AnalysisView, {
     data: dataDisplay,
     settings: settings,
@@ -3838,6 +4240,10 @@ function App() {
   }), showDataUpdate && /*#__PURE__*/React.createElement(DataUpdateModal, {
     onImport: handleImportData,
     onClose: () => setShowDataUpdate(false)
+  }), showMonitorImport && /*#__PURE__*/React.createElement(MonitorImportModal, {
+    defaultDate: latestDate || new Date().toISOString().slice(0, 10),
+    onClose: () => setShowMonitorImport(false),
+    onUploaded: handleUploadedMonitorFile
   }), /*#__PURE__*/React.createElement("style", null, `
         .app-shell { max-width: 1280px; margin: 0 auto; padding: 16px 20px 60px; }
         .app-header { padding:14px 20px; background:#0f172a; color:#fff; border-radius:12px; margin-bottom:16px; }
@@ -3990,6 +4396,18 @@ function App() {
         .entry-cal-day { font-size:12px; }
         .entry-cal-dot { position:absolute; bottom:3px; width:5px; height:5px; border-radius:50%; background:#10b981; }
         .entry-cal-note-icon { position:absolute; top:1px; right:2px; font-size:9px; line-height:1; }
+        .entry-cal-monitor-icon { position:absolute; top:1px; left:2px; font-size:9px; line-height:1; background:none; border:none; padding:2px; cursor:pointer; }
+        .monitor-list-item { display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:default; }
+        .monitor-list-actions { display:flex; gap:6px; flex-shrink:0; }
+        .monitor-preview-body { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; overflow:auto; background:#f1f5f9; border-radius:8px; margin-top:14px; }
+        .monitor-preview-frame { width:100%; height:min(75vh, 900px); border:none; border-radius:8px; }
+        .monitor-preview-image { max-width:100%; max-height:75vh; object-fit:contain; }
+        .monitor-dropzone {
+          border:2px dashed #cbd5e1; border-radius:10px; padding:24px 16px; text-align:center;
+          font-size:13px; color:#64748b; cursor:pointer; margin:10px 0; transition:background 0.15s, border-color 0.15s;
+        }
+        .monitor-dropzone:hover { background:#f8fafc; border-color:#94a3b8; }
+        .monitor-dropzone.drag-over { background:#eff6ff; border-color:#2563eb; color:#2563eb; }
         .entry-cal-dot.standalone { position:static; display:inline-block; margin-right:4px; }
         .entry-cal-dot.empty-dot { background:#e2e8f0; }
         .entry-cal-legend { display:flex; gap:14px; margin-top:10px; font-size:11px; color:#64748b; }
@@ -4021,6 +4439,11 @@ function App() {
         .entry-form-input-wrap input { width:110px; padding:6px 8px; border-radius:6px; border:1px solid #cbd5e1; font-size:13px; }
         .entry-form-unit { font-size:12px; color:#94a3b8; width:36px; }
         .entry-form-computed { margin-top:14px; padding:10px 12px; background:#f8fafc; border-radius:8px; font-size:12px; color:#475569; display:flex; flex-direction:column; gap:4px; }
+        @media (max-width: 900px) {
+          .entry-form-header-row, .entry-form-row { grid-template-columns:1fr 56px 56px 112px; gap:4px; }
+          .entry-form-input-wrap input { width:78px; }
+          .entry-form-unit { width:auto; }
+        }
         .entry-form-actions { display:flex; justify-content:space-between; align-items:center; margin-top:16px; }
         .entry-form-actions .btn-primary:disabled { opacity:0.5; cursor:not-allowed; }
         .entry-validation { margin-top:12px; padding:8px 12px; border-radius:8px; font-size:12px; }
@@ -4073,6 +4496,9 @@ function App() {
         .app-shell[data-theme="dark"] .anomaly-table th { background:#0f172a; }
         .app-shell[data-theme="dark"] .anomaly-table td, .app-shell[data-theme="dark"] .anomaly-table th { border-color:#334155; }
         .app-shell[data-theme="dark"] .add-chart-btn { background:#1e293b; border-color:#334155; color:#94a3b8; }
+        .app-shell[data-theme="dark"] .monitor-dropzone { border-color:#334155; color:#94a3b8; }
+        .app-shell[data-theme="dark"] .monitor-dropzone:hover { background:#1e293b; border-color:#475569; }
+        .app-shell[data-theme="dark"] .monitor-dropzone.drag-over { background:#0c2a4a; border-color:#2563eb; color:#bfdbfe; }
         .app-shell[data-theme="dark"] .empty-state, .app-shell[data-theme="dark"] .chart-empty,
         .app-shell[data-theme="dark"] .analysis-empty { color:#64748b; }
         .app-shell[data-theme="dark"] .target-bar-bg { background:#0f172a; }

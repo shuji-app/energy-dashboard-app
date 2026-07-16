@@ -21,7 +21,8 @@ http.createServer((req, res) => {
   fs.readFile(full, (err, data) => {
     if (err) { res.writeHead(404); res.end("not found: " + full); return; }
     const ext = path.extname(full);
-    res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
+    // 開発中の再ビルド内容がブラウザキャッシュで古いまま表示され続けるのを防ぐ
+    res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "no-store" });
     res.end(data);
   });
 }).listen(PORT, () => console.log("listening on " + PORT + ", root=" + ROOT));

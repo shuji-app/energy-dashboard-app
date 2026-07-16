@@ -7,9 +7,14 @@
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#0f172a">
 <link rel="icon" href="icons/icon-192.png">
+<!-- iPad/iPhoneでホーム画面に追加した際、Safariのアドレスバー無しで独立アプリ風に起動させるための設定 -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="エネルギー管理">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
 <style>
   * { box-sizing: border-box; }
-  html, body { margin:0; padding:0; background:#f1f5f9; font-family:'Hiragino Sans','Hiragino Kaku Gothic ProN',Meiryo,sans-serif; color:#0f172a; }
+  html, body { margin:0; padding:0; background:#f1f5f9; font-family:'Hiragino Sans','Hiragino Kaku Gothic ProN',Meiryo,sans-serif; color:#0f172a; overflow-x:hidden; }
   #root { min-height:100vh; }
   #loading {
     position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
