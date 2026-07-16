@@ -4191,7 +4191,7 @@ function AuthGate() {
 }
 const rootEl = document.getElementById("root");
 if (window.ReactDOM.createRoot) {
-  window.ReactDOM.createRoot(rootEl).render(/*#__PURE__*/React.createElement(AuthGate, null));
+  window.ReactDOM.createRoot(rootEl).render(/*#__PURE__*/React.createElement(App, null));
 } else {
-  window.ReactDOM.render(/*#__PURE__*/React.createElement(AuthGate, null), rootEl);
+  window.ReactDOM.render(/*#__PURE__*/React.createElement(App, null), rootEl);
 }

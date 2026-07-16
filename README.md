@@ -67,19 +67,25 @@ node -e "require('@babel/core').transformSync(require('fs').readFileSync('app.js
 ```
 
 ## デプロイ・動作環境についての注意
-- GitHub Pagesでの公開を想定しています。デプロイ手順は以下の通り：
-  1. GitHubで**公開**リポジトリを作成する（無料プランでPagesを使うには公開リポジトリが必須。
-     非公開でPagesを使うにはGitHub Pro等の有料プランが必要）。
-  2. このフォルダを`git init`してリモートに追加し、`git push`する
-     （`node_modules`・`docs/`・`app.jsx`等の開発用ファイルも一緒にコミットして問題ない
-     　― `index.html`が実際に読み込むのは`app.compiled.js`のみなので動作に影響しない）。
-  3. リポジトリの Settings → Pages → Branch を `main` / `/(root)` に設定して保存。
-     数分で `https://<ユーザー名>.github.io/<リポジトリ名>/` で公開される。
-  4. **公開リポジトリにする場合は、Firebase同期を使う前に必ず「Firebaseの初回セットアップ」の
-     手順4（認証を必須にするルール変更）を行ってください。** ソースコードが公開されると
-     `firebaseConfig`（APIキー・データベースURL）も誰でも閲覧できる状態になるため、
-     認証なしのルール（`.read/.write: true`）のままだと第三者がデータベースを自由に
-     読み書きできてしまいます。
+- **現在GitHub Pagesで公開中**：`https://github.com/shuji-app/energy-dashboard-app`（公開リポジトリ）
+  → `https://shuji-app.github.io/energy-dashboard-app/`。
+  - この環境（Claude Code）からは`git push`が対話的なGitHub認証を必要とし自動化できなかったため、
+    実際のアップロードは`git archive HEAD`で`.gitignore`適用済みのファイル一式を別フォルダに
+    展開し、GitHubの「Add file → Upload files」でユーザーがドラッグ＆ドロップする方式で行っている。
+    コードを更新した場合、同じ手順（`git archive`→展開→手動アップロード）を再度行う必要がある
+    （`git push`が使える環境であれば、通常通り`git push`で構わない）。
+  - `node_modules`・`docs/`・`app.jsx`等の開発用ファイルも一緒にアップロードして問題ない
+    （`index.html`が実際に読み込むのは`app.compiled.js`のみなので動作に影響しない。
+    ただし`node_modules`は`.gitignore`で除外済み＝アップロード対象に含まれない）。
+  - Pagesの設定：Settings → Pages → Branch: `main` / `/(root)`。
+- **⚠ 現状、Firebase同期は認証なし（お試し運用）**：「今はお試しなので、ユーザー制限は設けない」
+  という判断により、Realtime Databaseのルールは`{".read": true, ".write": true}`のまま、
+  アプリ側の`AuthGate`（サインイン必須のログイン画面）も無効化した状態
+  （`app.jsx`末尾のルート描画は`<App/>`のまま。`<AuthGate/>`に戻せばログイン必須に戻せる）。
+  公開リポジトリである以上、`firebaseConfig`（APIキー・データベースURL）は誰でも閲覧できるため、
+  この状態は**URLとキーを知っていれば誰でもデータベースを読み書きできてしまう**ことを意味する。
+  本運用に進める際は、必ず「Firebaseの初回セットアップ」手順4（認証必須のルールに変更）と、
+  `app.jsx`末尾のルート描画を`<AuthGate/>`に戻すことをセットで行うこと。
 - オフラインでは初回起動できません（React本体等をCDNから読み込むため、初回は必ずインターネット
   接続が必要）。2回目以降はService Workerがオフライン起動に対応します。
 - **コード修正後にブラウザに反映されない場合**は、Service Workerのキャッシュが原因の可能性があります。

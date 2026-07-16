@@ -2915,7 +2915,7 @@ function AuthGate() {
 
 const rootEl = document.getElementById("root");
 if (window.ReactDOM.createRoot) {
-  window.ReactDOM.createRoot(rootEl).render(<AuthGate />);
+  window.ReactDOM.createRoot(rootEl).render(<App />);
 } else {
-  window.ReactDOM.render(<AuthGate />, rootEl);
+  window.ReactDOM.render(<App />, rootEl);
 }
