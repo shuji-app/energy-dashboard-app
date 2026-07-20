@@ -136,6 +136,31 @@ node -e "require('@babel/core').transformSync(require('fs').readFileSync('app.js
    `data/energy-data.js`の初期データ・`data/energy-data.json`の入れ替えは今まで通り可能ですが、
    Firebase同期を有効にした場合はRealtime Database側のデータが優先されます。
 
+### Gemini分析コメントの初回セットアップ（任意）
+分析ビューの各グラフには「🤖 Geminiで分析」ボタンがあり、押すとGoogleのGemini AIが
+そのグラフのデータについて実務的なコメントを生成します。デフォルトでは無効（ボタンを押すと
+「URLが未設定」というエラーが出るだけ）で、他の機能には一切影響しません。使うには以下の設定が必要です。
+
+**なぜこんな構成になっているか**：GeminiのAPIキーをこのアプリ（公開リポジトリ）に直接書くと
+誰でも読み取れてしまうため、**Google Apps Script（無料）を簡易バックエンドとして経由**させ、
+APIキーはApps Script側だけに保管する構成にしています。
+
+1. https://aistudio.google.com にアクセスし、（会社・個人どちらでも可の）Googleアカウントで
+   ログインしてAPIキーを発行する。
+2. https://script.google.com で新しいプロジェクトを作成し、`scripts/gemini-proxy-apps-script.gs.txt`
+   の中身をコピーして貼り付ける（このファイル自体はApps Script用の参考ファイルで、
+   energy-dashboard-app本体の動作には使われません）。
+3. Apps Scriptの「プロジェクトの設定」→「スクリプト プロパティ」で、
+   プロパティ名`GEMINI_API_KEY`・値に手順1で発行したAPIキーを追加。
+4. 「デプロイ」→「新しいデプロイ」→ 種類「ウェブアプリ」を選び、
+   「次のユーザーとして実行: 自分」「アクセスできるユーザー: 全員」でデプロイ。
+   発行された`https://script.google.com/macros/s/.../exec`形式のURLをコピー。
+5. `app.jsx`内の`GEMINI_PROXY_URL`定数（ファイル冒頭、Firebase設定の直後）に、
+   手順4のURLを貼り付けて`npm run build`。
+6. コードを修正して再デプロイする場合は、Apps Script側で「新しいデプロイ」ではなく
+   既存デプロイの「編集（鉛筆アイコン）」→ バージョン「新バージョン」を選んで
+   デプロイし直さないと、公開URLに変更が反映されない点に注意。
+
 ## Claude Codeで作業するときのお願い
 - 大きな仕様変更・新機能を実装したときは、`docs/引継ぎ.md`にも追記してください。今後もこのファイルを
   見ながら作業を続ける前提のため、同じ場所に履歴を残すと一貫性が保てます。

@@ -96,6 +96,35 @@ if (fbApp) {
 // dbが使えるときだけ「同期あり」とし、そうでない場合はIndexedDBのみで完結する。
 const monitorSyncEnabled = !!db;
 
+// ─── Gemini連携（分析コメントの生成）───
+// GeminiのAPIキーはこのアプリ（公開リポジトリ）には一切含めない。代わりに、ユーザー自身の
+// Googleアカウントで作成したGoogle Apps Scriptのウェブアプリ（APIキーはApps Script側の
+// 「スクリプトプロパティ」に保管）を簡易バックエンドとして経由する。
+// 使い方：Apps Scriptのウェブアプリ公開後に発行されるURLをここに貼り付ける。
+// 未設定（プレースホルダーのまま）の場合は「🤖 Geminiで分析」ボタンがエラーメッセージを表示するだけで、
+// 他の機能には一切影響しない。
+const GEMINI_PROXY_URL = "https://script.google.com/macros/s/AKfycbxJMqMLXZJKqKjGtCwMYI-I1jlOpcAwTKsEq9TuXzHd0Xj7-gkx9-8im8Tp1tL2764UiQ/exec";
+
+async function fetchGeminiComment(prompt) {
+  if (!GEMINI_PROXY_URL || GEMINI_PROXY_URL === "YOUR_APPS_SCRIPT_WEB_APP_URL") {
+    throw new Error("Apps ScriptのURLが未設定です（app.jsx内のGEMINI_PROXY_URLを設定してください）。");
+  }
+  // Content-Typeを明示すると事前のCORSプリフライト(OPTIONS)が発生し、Apps Script側が
+  // これに対応していないため失敗する。text/plain（既定値）のまま送ることでこれを回避する。
+  const res = await fetch(GEMINI_PROXY_URL, { method: "POST", body: JSON.stringify({ prompt }) });
+  if (!res.ok) throw new Error(`通信エラー（${res.status}）`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.comment || "(コメントを取得できませんでした)";
+}
+
+function buildAnalysisPrompt(title, dataText) {
+  return `あなたは工場設備のエネルギー管理の専門家です。次のデータについて、200字程度の日本語で実務的な分析コメントを1つだけ書いてください。数値の解説だけでなく、可能なら改善のヒントも添えてください。前置きや見出しは不要で、コメント本文だけを返してください。\n\n【${title}】\n${dataText}`;
+}
+function seriesText(labels, values, unit) {
+  return labels.map((l, i) => `${l}: ${values[i] != null ? fmtNum(values[i], 2) + unit : "欠測"}`).join(" / ");
+}
+
 // Firebaseへの書き込みは、状態の変化を監視するeffectではなく、実際にユーザーが保存操作をした
 // タイミング（各handle*関数）からのみ呼び出す。これにより「リモートの変更を受けて再度書き込む」
 // という無限ループを構造的に避けられる（ローカルstateはFirebaseの内容を映すミラーとして扱う）。
@@ -425,6 +454,25 @@ function buildRegression(rows, key) {
     .map((r) => [r.tempAvg, r[key]])
     .filter(([x, y]) => x != null && y != null && !isNaN(x) && !isNaN(y));
   return linreg(pts);
+}
+// ============================================================
+// 分析コメントの自動生成（実際のLLM呼び出しは行わない、数値ベースのルール生成）
+// ============================================================
+// 系列（labels/valuesが対応、nullは欠測扱い）から傾向・最大最小を短文コメントにする
+function trendInsight(labels, values, unit, digits = 1) {
+  const pts = values.map((v, i) => ({ v, i })).filter((p) => p.v != null && !isNaN(p.v));
+  if (pts.length < 2) return "データが少なく、傾向を判定できません。";
+  const first = pts[0], last = pts[pts.length - 1];
+  const reg = linreg(pts.map((p) => [p.i, p.v]));
+  const base = Math.abs(first.v) > 0.0001 ? first.v : (pts.reduce((s, p) => s + Math.abs(p.v), 0) / pts.length || 1);
+  const pct = ((last.v - first.v) / Math.abs(base)) * 100;
+  const dir = Math.abs(pct) < 3 ? "ほぼ横ばい" : pct > 0 ? "上昇傾向" : "低下傾向";
+  const maxPt = pts.reduce((a, b) => (b.v > a.v ? b : a));
+  const minPt = pts.reduce((a, b) => (b.v < a.v ? b : a));
+  let s = `${labels[first.i]}から${labels[last.i]}にかけて${dir}です`;
+  if (Math.abs(pct) >= 3) s += `（${pct > 0 ? "+" : ""}${pct.toFixed(1)}%）`;
+  s += `。最大は${labels[maxPt.i]}（${fmtNum(maxPt.v, digits)}${unit}）、最小は${labels[minPt.i]}（${fmtNum(minPt.v, digits)}${unit}）でした。`;
+  return s;
 }
 function historicalAvgTempForCalendarDay(rows, monthDay) {
   const vals = rows.filter((r) => r.date.slice(5) === monthDay).map((r) => r.tempAvg).filter((v) => v != null);
@@ -1590,6 +1638,46 @@ function MonitorPreviewModal({ date, fileMeta, onClose, onDelete }) {
 // ============================================================
 const ANALYSIS_METRIC_CHOICES = ["elecKWh", "oilTotalL", "coolLoadGJ", "heatLoadGJ", "efficiencyPct", "co2T", "crudeOilKL", "costYen"];
 
+function GranularityToggle({ value, onChange }) {
+  return (
+    <div className="granularity-toggle">
+      {[["day", "日"], ["month", "月"], ["year", "年"]].map(([v, l]) => (
+        <button key={v} className={"btn btn-small" + (value === v ? " active" : "")} onClick={() => onChange(v)}>{l}</button>
+      ))}
+    </div>
+  );
+}
+
+function AiCommentBox({ buildPrompt }) {
+  const [status, setStatus] = useState("idle"); // idle | loading | done | error
+  const [comment, setComment] = useState("");
+
+  const handleClick = async () => {
+    setStatus("loading");
+    try {
+      const text = await fetchGeminiComment(buildPrompt());
+      setComment(text);
+      setStatus("done");
+    } catch (e) {
+      setComment(e.message);
+      setStatus("error");
+    }
+  };
+
+  return (
+    <div className="ai-gemini-box">
+      <button className="btn btn-small" onClick={handleClick} disabled={status === "loading"}>
+        {status === "loading" ? "🤖 分析中…" : "🤖 Geminiで分析"}
+      </button>
+      {comment && (
+        <p className={"analysis-note ai-comment" + (status === "error" ? " ai-comment-error" : "")}>
+          {status === "error" ? "⚠ " : "🤖 "}{comment}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
   const fiscalYears = useMemo(() => Array.from(new Set(data.map((r) => fiscalYear(r.date)))).sort((a, b) => a - b), [data]);
   const [fy, setFy] = useState(() => fiscalYears[fiscalYears.length - 1]);
@@ -1599,6 +1687,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
   const [overlayYears, setOverlayYears] = useState(() => fiscalYears.slice(-3));
   const [sensitivityMetric, setSensitivityMetric] = useState("elecKWh");
   const [weekdayMetric, setWeekdayMetric] = useState("elecKWh");
+  const [intensityGranularity, setIntensityGranularity] = useState("month");
+  const [co2Granularity, setCo2Granularity] = useState("month");
+  const [demandGranularity, setDemandGranularity] = useState("day");
 
   const monthKeys = useMemo(() => fiscalMonthKeys(fy), [fy]);
   const fyRows = useMemo(() => data.filter((r) => fiscalYear(r.date) === fy), [data, fy]);
@@ -1607,21 +1698,32 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
   const prevMonthlyRows = useMemo(() => fiscalMonthKeys(fy - 1).map((ym) => data.filter((r) => r.date.startsWith(ym))), [data, fy]);
   const byDate = useMemo(() => { const m = {}; data.forEach((r) => { m[r.date] = r; }); return m; }, [data]);
 
-  // 1. 原単位トレンド（月次）
-  const intensityConfig = () => {
-    const elec = monthlyRows.map((rows) => { const load = sumMetric(rows, "totalLoadGJ"); return load > 0 ? sumMetric(rows, "elecKWh") / load : null; });
-    const oil = monthlyRows.map((rows) => { const load = sumMetric(rows, "totalLoadGJ"); return load > 0 ? sumMetric(rows, "oilTotalL") / load : null; });
-    return {
-      type: "line",
-      data: { labels: FM_LABELS, datasets: [
-        { label: "電力原単位 (kWh/GJ)", data: elec, borderColor: "#2563eb", backgroundColor: "#2563eb33", yAxisID: "y", tension: 0.25, spanGaps: true },
-        { label: "重油原単位 (L/GJ)", data: oil, borderColor: "#dc2626", backgroundColor: "#dc262633", yAxisID: "y1", tension: 0.25, spanGaps: true },
-      ]},
-      options: { responsive: true, maintainAspectRatio: false,
-        scales: { y: { position: "left", title: { display: true, text: "kWh/GJ" } }, y1: { position: "right", title: { display: true, text: "L/GJ" }, grid: { drawOnChartArea: false } } },
-        plugins: { legend: { position: "bottom" } }, interaction: { mode: "index", intersect: false } },
-    };
+  // グラフごとの日/月/年切替：選択中の年度内の日次、年度内の月次、または全年度の年次で束ねる
+  const granularityData = (gran) => {
+    if (gran === "day") return { labels: fyRows.map((r) => r.date.slice(5)), buckets: fyRows.map((r) => [r]) };
+    if (gran === "year") return { labels: fiscalYears.map((y) => `${y}年度`), buckets: fiscalYears.map((y) => data.filter((r) => fiscalYear(r.date) === y)) };
+    return { labels: FM_LABELS, buckets: monthlyRows };
   };
+
+  // 1. 原単位トレンド
+  const intensityData = useMemo(() => {
+    const { labels, buckets } = granularityData(intensityGranularity);
+    const elec = buckets.map((rows) => { const load = sumMetric(rows, "totalLoadGJ"); return load > 0 ? sumMetric(rows, "elecKWh") / load : null; });
+    const oil = buckets.map((rows) => { const load = sumMetric(rows, "totalLoadGJ"); return load > 0 ? sumMetric(rows, "oilTotalL") / load : null; });
+    return { labels, elec, oil };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, fy, intensityGranularity, monthlyRows]);
+  const intensityConfig = () => ({
+    type: "line",
+    data: { labels: intensityData.labels, datasets: [
+      { label: "電力原単位 (kWh/GJ)", data: intensityData.elec, borderColor: "#2563eb", backgroundColor: "#2563eb33", yAxisID: "y", tension: 0.25, spanGaps: true },
+      { label: "重油原単位 (L/GJ)", data: intensityData.oil, borderColor: "#dc2626", backgroundColor: "#dc262633", yAxisID: "y1", tension: 0.25, spanGaps: true },
+    ]},
+    options: { responsive: true, maintainAspectRatio: false,
+      scales: { y: { position: "left", title: { display: true, text: "kWh/GJ" } }, y1: { position: "right", title: { display: true, text: "L/GJ" }, grid: { drawOnChartArea: false } } },
+      plugins: { legend: { position: "bottom" } }, interaction: { mode: "index", intersect: false } },
+  });
+  const intensityComment = `電力原単位：${trendInsight(intensityData.labels, intensityData.elec, "kWh/GJ", 2)} 重油原単位：${trendInsight(intensityData.labels, intensityData.oil, "L/GJ", 2)}`;
 
   // 2. 異常値検知（気温回帰から±2σ以上乖離した日）
   const anomaly = useMemo(() => {
@@ -1645,22 +1747,45 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
       .slice(0, 15);
     return { sd, list, meta };
   }, [data, fyRows, anomalyMetric, settings.anomalySigmaThreshold]);
+  const anomalyComment = anomaly.list.length === 0
+    ? `しきい値（±${fmtNum(settings.anomalySigmaThreshold, 1)}σ）を超える異常日は検出されませんでした。`
+    : `${anomaly.list.length}件の異常日を検出。最大乖離は${anomaly.list[0].date}で${anomaly.list[0].sigma > 0 ? "+" : ""}${fmtNum(anomaly.list[0].sigma, 1)}σ（実績${fmtNum(anomaly.list[0].actual, 0)}${anomaly.meta.unit} / 回帰予測${fmtNum(anomaly.list[0].pred, 0)}${anomaly.meta.unit}）でした。`;
 
   // 3. 号機別稼働バランス
-  const balanceConfig = () => {
-    const keys = ["oilChiller1L", "oilChiller2L", "oilBoiler1L", "oilBoiler2L"];
-    return {
-      type: "doughnut",
-      data: { labels: keys.map((k) => METRICS[k].label), datasets: [{ data: keys.map((k) => sumMetric(fyRows, k)), backgroundColor: keys.map((k) => METRICS[k].color) }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom" } } },
-    };
-  };
+  const BALANCE_KEYS = ["oilChiller1L", "oilChiller2L", "oilBoiler1L", "oilBoiler2L"];
+  const balanceConfig = () => ({
+    type: "doughnut",
+    data: { labels: BALANCE_KEYS.map((k) => METRICS[k].label), datasets: [{ data: BALANCE_KEYS.map((k) => sumMetric(fyRows, k)), backgroundColor: BALANCE_KEYS.map((k) => METRICS[k].color) }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom" } } },
+  });
+  const balanceComment = (() => {
+    const totals = BALANCE_KEYS.map((k) => ({ key: k, label: METRICS[k].label, v: sumMetric(fyRows, k) }));
+    const sum = totals.reduce((s, t) => s + t.v, 0);
+    if (sum <= 0) return "データが不足しており判定できません。";
+    const top = totals.reduce((a, b) => (b.v > a.v ? b : a));
+    const share = (top.v / sum) * 100;
+    const note = share >= 60 ? "特定号機への偏りが大きく、非効率や不調のサインの可能性があります。" : "各号機への負荷はおおむね分散しています。";
+    return `最も稼働比率が高いのは${top.label}（全体の${fmtNum(share, 1)}%）です。${note}`;
+  })();
 
   // 4. 目標比較
   const targets = [
     { key: "elecKWh", label: "受電電力量", unit: "kWh", target: settings.targetElecKWh, actual: sumMetric(fyRows, "elecKWh") },
     { key: "oilTotalL", label: "重油使用量", unit: "L", target: settings.targetOilL, actual: sumMetric(fyRows, "oilTotalL") },
   ];
+  const targetsComment = (() => {
+    const active = targets.filter((t) => t.target);
+    if (!active.length) return null;
+    const totalDaysInFY = monthKeys.reduce((s, ym) => s + daysInMonth(ym), 0);
+    const elapsedFrac = totalDaysInFY > 0 ? Math.min(1, fyRows.length / totalDaysInFY) : 0;
+    const expectedPct = elapsedFrac * 100;
+    return active.map((t) => {
+      const pct = (t.actual / t.target) * 100;
+      const diff = pct - expectedPct;
+      const pace = Math.abs(diff) < 5 ? "ほぼ想定ペース通り" : diff > 0 ? "想定ペースより速いペース" : "想定ペースより遅いペース";
+      return `${t.label}：実績${fmtNum(pct, 1)}%（経過日数ベースの目安${fmtNum(expectedPct, 1)}%に対して${pace}）`;
+    }).join(" / ");
+  })();
 
   // 5. カレンダーヒートマップ
   const heatmap = useMemo(() => {
@@ -1681,34 +1806,54 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
     });
     return { rows, max, meta };
   }, [byDate, fyRows, monthKeys, heatmapMetric]);
+  const heatmapComment = (() => {
+    const vals = heatmap.rows.flatMap((r) => r.cells.filter((c) => c && c.v != null));
+    if (!vals.length) return "データが不足しており判定できません。";
+    const maxCell = vals.reduce((a, b) => (b.v > a.v ? b : a));
+    const avg = vals.reduce((s, c) => s + c.v, 0) / vals.length;
+    return `最大値は${maxCell.dateStr}（${fmtNum(maxCell.v, 1)} ${heatmap.meta.unit}）。期間平均は${fmtNum(avg, 1)} ${heatmap.meta.unit}です。`;
+  })();
 
-  // 6. CO2トレンド（月次・前年度比較）
+  // 6. CO2トレンド
   const co2Of = (rows) => (sumMetric(rows, "elecKWh") * settings.elecCO2PerKWh + sumMetric(rows, "oilTotalL") * settings.oilCO2PerL) / 1000;
+  const co2Data = useMemo(() => {
+    const { labels, buckets } = granularityData(co2Granularity);
+    const current = buckets.map((rows) => (rows.length ? co2Of(rows) : null));
+    // 月次表示のときだけ前年度比較の第2系列も出す（日次・年次では対応する「前期」の定義が曖昧なため）
+    const prev = co2Granularity === "month" ? prevMonthlyRows.map((rows) => (rows.length ? co2Of(rows) : null)) : null;
+    return { labels, current, prev };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, fy, co2Granularity, monthlyRows, prevMonthlyRows, settings.elecCO2PerKWh, settings.oilCO2PerL]);
   const co2Config = () => ({
     type: "bar",
-    data: { labels: FM_LABELS, datasets: [
-      { label: `${fy}年度 (t-CO2)`, data: monthlyRows.map((rows) => (rows.length ? co2Of(rows) : null)), backgroundColor: "#0f766eaa" },
-      { label: `${fy - 1}年度 (t-CO2)`, data: prevMonthlyRows.map((rows) => (rows.length ? co2Of(rows) : null)), backgroundColor: "#94a3b8aa" },
+    data: { labels: co2Data.labels, datasets: [
+      { label: `${fy}年度 (t-CO2)`, data: co2Data.current, backgroundColor: "#0f766eaa" },
+      ...(co2Data.prev ? [{ label: `${fy - 1}年度 (t-CO2)`, data: co2Data.prev, backgroundColor: "#94a3b8aa" }] : []),
     ]},
     options: { responsive: true, maintainAspectRatio: false, scales: { y: { title: { display: true, text: "t-CO2" } } }, plugins: { legend: { position: "bottom" } } },
   });
   const co2TotalThis = co2Of(fyRows);
   const co2TotalPrev = prevFyRows.length ? co2Of(prevFyRows) : null;
+  const co2Comment = trendInsight(co2Data.labels, co2Data.current, "t-CO2", 1);
 
   // 7. デマンド分析（日平均電力ベース）
-  const demandConfig = () => {
-    const labels = fyRows.map((r) => r.date.slice(5));
-    return {
-      type: "line",
-      data: { labels, datasets: [
-        { label: "日平均電力 (kW)", data: fyRows.map((r) => r.demandKW), borderColor: "#f59e0b", backgroundColor: "#f59e0b33", pointRadius: 0, borderWidth: 2, tension: 0.2 },
-        { label: `契約電力 ${fmtNum(settings.contractKW, 0)} kW`, data: fyRows.map(() => settings.contractKW), borderColor: "#dc2626", borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 },
-      ]},
-      options: { responsive: true, maintainAspectRatio: false,
-        scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } }, y: { title: { display: true, text: "kW" } } },
-        plugins: { legend: { position: "bottom" } }, interaction: { mode: "index", intersect: false } },
-    };
-  };
+  const demandData = useMemo(() => {
+    const { labels, buckets } = granularityData(demandGranularity);
+    const values = buckets.map((rows) => (rows.length ? aggMetric(rows, "demandKW") : null));
+    return { labels, values };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, fy, demandGranularity, monthlyRows]);
+  const demandConfig = () => ({
+    type: "line",
+    data: { labels: demandData.labels, datasets: [
+      { label: demandGranularity === "day" ? "日平均電力 (kW)" : "平均電力 (kW)", data: demandData.values, borderColor: "#f59e0b", backgroundColor: "#f59e0b33", pointRadius: 0, borderWidth: 2, tension: 0.2 },
+      { label: `契約電力 ${fmtNum(settings.contractKW, 0)} kW`, data: demandData.labels.map(() => settings.contractKW), borderColor: "#dc2626", borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 },
+    ]},
+    options: { responsive: true, maintainAspectRatio: false,
+      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } }, y: { title: { display: true, text: "kW" } } },
+      plugins: { legend: { position: "bottom" } }, interaction: { mode: "index", intersect: false } },
+  });
+  const demandComment = trendInsight(demandData.labels, demandData.values, "kW", 0);
   const demandHistogram = useMemo(() => {
     const bins = [
       { label: "〜60%", min: -Infinity, max: 60, count: 0 },
@@ -1729,6 +1874,11 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
     });
     return { bins, over90, over100 };
   }, [fyRows, settings.contractKW]);
+  const demandHistComment = demandHistogram.over100 > 0
+    ? `契約電力を超過した日が${demandHistogram.over100}日あります。契約電力の見直し、またはピーク時の使用量抑制をご検討ください。`
+    : demandHistogram.over90 > 0
+    ? `契約電力の90%以上に達した日が${demandHistogram.over90}日あります。契約超過の兆候として注意が必要です。`
+    : "契約電力の90%を超えた日はなく、余裕を持って運用できています。";
   const demandHistConfig = () => ({
     type: "bar",
     data: { labels: demandHistogram.bins.map((b) => b.label), datasets: [{ label: "日数", data: demandHistogram.bins.map((b) => b.count), backgroundColor: demandHistogram.bins.map((b) => (b.min >= 100 ? "#dc2626aa" : b.min >= 90 ? "#f59e0baa" : "#2563ebaa")) }] },
@@ -1764,6 +1914,18 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
       },
     };
   };
+  const overlayComment = (() => {
+    if (overlayYears.length < 2) return "比較する年度を2つ以上選ぶと、年度間の傾向差を比較できます。";
+    const totals = overlayYears.map((y) => {
+      const monthly = fiscalMonthKeys(y).map((ym) => data.filter((r) => r.date.startsWith(ym)));
+      return { y, total: sumMetric(monthly.flat(), overlayMetric) };
+    });
+    const latest = totals[totals.length - 1];
+    const prevAvg = totals.slice(0, -1).reduce((s, t) => s + t.total, 0) / (totals.length - 1);
+    const pct = prevAvg > 0 ? ((latest.total - prevAvg) / prevAvg) * 100 : null;
+    if (pct == null) return `${latest.y}年度の合計は${fmtNum(latest.total, 0)} ${METRICS[overlayMetric].unit}です。`;
+    return `${latest.y}年度の合計は${fmtNum(latest.total, 0)} ${METRICS[overlayMetric].unit}で、他の選択年度の平均比${fmtPct(pct)}です。`;
+  })();
 
   // 9. 気温感応度分析（年度別の回帰の傾き＝気温1℃あたりの増減）
   const sensitivity = useMemo(() => {
@@ -1788,6 +1950,14 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
     },
   });
   const sensitivityLatest = sensitivity.byYear.length ? sensitivity.byYear[sensitivity.byYear.length - 1] : null;
+  const sensitivityComment = (() => {
+    const valid = sensitivity.byYear.filter((x) => x.slope != null && !isNaN(x.slope));
+    if (valid.length < 2) return "年度データが少なく、傾向を判定できません。";
+    const first = valid[0], last = valid[valid.length - 1];
+    const diff = last.slope - first.slope;
+    const dir = Math.abs(diff) < Math.abs(first.slope) * 0.05 ? "ほぼ横ばい" : diff > 0 ? "年々大きくなっています（温度依存の効率低下の可能性）" : "年々小さくなっています（温度依存の効率改善の可能性）";
+    return `${first.fy}年度は${fmtNum(first.slope, 2)}、${last.fy}年度は${fmtNum(last.slope, 2)} ${sensitivity.meta.unit}/℃で、気温感応度は${dir}。`;
+  })();
 
   // 10. 曜日別パターン
   const WEEKDAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"];
@@ -1818,6 +1988,18 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
       plugins: { legend: { display: false } },
     },
   });
+  const weekdayComment = (() => {
+    const withIdx = WEEKDAY_ORDER.map((wd, i) => ({ wd, label: WEEKDAY_LABELS[i], v: weekdayPattern[i] })).filter((x) => x.v != null);
+    if (withIdx.length < 2) return "データが少なく、傾向を判定できません。";
+    const max = withIdx.reduce((a, b) => (b.v > a.v ? b : a));
+    const min = withIdx.reduce((a, b) => (b.v < a.v ? b : a));
+    const weekdayAvg = withIdx.filter((x) => x.wd >= 1 && x.wd <= 5).reduce((s, x, _, arr) => s + x.v / arr.length, 0);
+    const weekendAvg = withIdx.filter((x) => x.wd === 0 || x.wd === 6).reduce((s, x, _, arr) => s + x.v / (arr.length || 1), 0);
+    const gap = weekendAvg > 0 ? ((weekdayAvg - weekendAvg) / weekendAvg) * 100 : null;
+    let s = `最も高いのは${max.label}曜日（${fmtNum(max.v, 1)}）、最も低いのは${min.label}曜日（${fmtNum(min.v, 1)}）です。`;
+    if (gap != null) s += `平日は休日より平均${fmtPct(gap)}${gap >= 0 ? "多い" : "少ない"}使用量です。`;
+    return s;
+  })();
 
   // 11. 年間目標への累積進捗
   const cumulativeProgress = useMemo(() => {
@@ -1866,14 +2048,20 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
       </nav>
 
       <section className="chart-panel">
-        <div className="panel-title">1. 原単位トレンド（供給熱量1GJあたりの投入エネルギー・月次）</div>
+        <div className="panel-title-row">
+          <div className="panel-title">1. 原単位トレンド（供給熱量1GJあたりの投入エネルギー）</div>
+          <GranularityToggle value={intensityGranularity} onChange={setIntensityGranularity} />
+        </div>
         <p className="analysis-note">数値が上昇傾向なら「同じ熱を作るのに多くのエネルギーが必要になっている」＝設備効率低下のサインです。</p>
         <div className="chart-canvas-toolbar">
           <button className="btn btn-small" onClick={(e) => downloadChartCanvasImage(e.currentTarget.parentElement, "原単位トレンド.png")}>🖼 画像保存</button>
         </div>
         <div className="chart-canvas-wrap">
-          <ChartCanvas key={`int-${fy}-${darkMode}`} getConfig={intensityConfig} />
+          <ChartCanvas key={`int-${fy}-${intensityGranularity}-${darkMode}`} getConfig={intensityConfig} />
         </div>
+        <p className="analysis-note ai-comment">💬 {intensityComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("原単位トレンド（電力・重油）",
+          `電力原単位(kWh/GJ): ${seriesText(intensityData.labels, intensityData.elec, "")}\n重油原単位(L/GJ): ${seriesText(intensityData.labels, intensityData.oil, "")}`)} />
       </section>
 
       <section className="chart-panel">
@@ -1884,6 +2072,10 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
           </select>
         </div>
         <p className="analysis-note">全期間データで「外気温度→{anomaly.meta.label}」の回帰モデルを作り、予測から大きく外れた日を検出します（設備異常・誤記録の早期発見用）。</p>
+        <p className="analysis-note ai-comment">💬 {anomalyComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt(`異常値検知（${anomaly.meta.label}）`,
+          anomaly.list.length === 0 ? "異常日は検出されていません。"
+            : anomaly.list.slice(0, 5).map((x) => `${x.date}: 実績${fmtNum(x.actual, 0)}${anomaly.meta.unit}, 回帰予測${fmtNum(x.pred, 0)}${anomaly.meta.unit}, 乖離${fmtNum(x.sigma, 1)}σ`).join("\n"))} />
         {anomaly.list.length === 0 ? (
           <div className="analysis-empty">±2σを超える異常日は検出されませんでした。</div>
         ) : (
@@ -1927,6 +2119,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         <div className="chart-canvas-wrap">
           <ChartCanvas key={`bal-${fy}-${darkMode}`} getConfig={balanceConfig} />
         </div>
+        <p className="analysis-note ai-comment">💬 {balanceComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("重油 号機別稼働バランス",
+          BALANCE_KEYS.map((k) => `${METRICS[k].label}: ${fmtNum(sumMetric(fyRows, k), 0)} L`).join(" / "))} />
       </section>
 
       <section className="chart-panel">
@@ -1934,18 +2129,23 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         {targets.every((t) => !t.target) ? (
           <div className="analysis-empty">年度目標が未設定です。「設定」画面から目標値を入力してください。</div>
         ) : (
-          targets.map((t) => {
-            if (!t.target) return null;
-            const pct = (t.actual / t.target) * 100;
-            return (
-              <div key={t.label} className="target-row">
-                <div className="target-label">{t.label}: {fmtNum(t.actual, 0)} / 目標 {fmtNum(t.target, 0)} {t.unit}（{fmtNum(pct, 1)}%）</div>
-                <div className="target-bar-bg">
-                  <div className={"target-bar" + (pct > 100 ? " over" : "")} style={{ width: `${Math.min(100, pct)}%` }}></div>
+          <React.Fragment>
+            {targets.map((t) => {
+              if (!t.target) return null;
+              const pct = (t.actual / t.target) * 100;
+              return (
+                <div key={t.label} className="target-row">
+                  <div className="target-label">{t.label}: {fmtNum(t.actual, 0)} / 目標 {fmtNum(t.target, 0)} {t.unit}（{fmtNum(pct, 1)}%）</div>
+                  <div className="target-bar-bg">
+                    <div className={"target-bar" + (pct > 100 ? " over" : "")} style={{ width: `${Math.min(100, pct)}%` }}></div>
+                  </div>
                 </div>
-              </div>
-            );
-          })
+              );
+            })}
+            <p className="analysis-note ai-comment">💬 {targetsComment}</p>
+            <AiCommentBox buildPrompt={() => buildAnalysisPrompt("年度目標に対する進捗",
+              targets.filter((t) => t.target).map((t) => `${t.label}: 実績${fmtNum(t.actual, 0)}${t.unit} / 目標${fmtNum(t.target, 0)}${t.unit}`).join(" / "))} />
+          </React.Fragment>
         )}
       </section>
 
@@ -1973,10 +2173,15 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
             ))}
           </div>
         </div>
+        <p className="analysis-note ai-comment">💬 {heatmapComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt(`カレンダーヒートマップ（${heatmap.meta.label}）`, heatmapComment)} />
       </section>
 
       <section className="chart-panel">
-        <div className="panel-title">6. CO2排出量トレンド（月次・前年度比較）</div>
+        <div className="panel-title-row">
+          <div className="panel-title">6. CO2排出量トレンド</div>
+          <GranularityToggle value={co2Granularity} onChange={setCo2Granularity} />
+        </div>
         <p className="analysis-note">
           {fy}年度合計: <b>{fmtNum(co2TotalThis, 0)} t-CO2</b>
           {co2TotalPrev != null && <span>（前年度 {fmtNum(co2TotalPrev, 0)} t-CO2 / {fmtPct(((co2TotalThis - co2TotalPrev) / co2TotalPrev) * 100)}）</span>}
@@ -1985,12 +2190,17 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
           <button className="btn btn-small" onClick={(e) => downloadChartCanvasImage(e.currentTarget.parentElement, "CO2排出量トレンド.png")}>🖼 画像保存</button>
         </div>
         <div className="chart-canvas-wrap">
-          <ChartCanvas key={`co2-${fy}-${darkMode}`} getConfig={co2Config} />
+          <ChartCanvas key={`co2-${fy}-${co2Granularity}-${darkMode}`} getConfig={co2Config} />
         </div>
+        <p className="analysis-note ai-comment">💬 {co2Comment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("CO2排出量トレンド", seriesText(co2Data.labels, co2Data.current, "t-CO2"))} />
       </section>
 
       <section className="chart-panel">
-        <div className="panel-title">7. デマンド分析（日平均電力と契約電力）</div>
+        <div className="panel-title-row">
+          <div className="panel-title">7. デマンド分析（日平均電力と契約電力）</div>
+          <GranularityToggle value={demandGranularity} onChange={setDemandGranularity} />
+        </div>
         <p className="analysis-note">
           ※日次データのため30分デマンド実測ではなく「日平均電力（kWh÷24）」に基づく参考値です。
           契約比90%以上: <b>{demandHistogram.over90}日</b> / 100%以上: <b className="dev-up">{demandHistogram.over100}日</b>
@@ -1999,8 +2209,11 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
           <button className="btn btn-small" onClick={(e) => downloadChartCanvasImage(e.currentTarget.parentElement, "デマンド分析.png")}>🖼 画像保存</button>
         </div>
         <div className="chart-canvas-wrap">
-          <ChartCanvas key={`dem-${fy}-${darkMode}`} getConfig={demandConfig} />
+          <ChartCanvas key={`dem-${fy}-${demandGranularity}-${darkMode}`} getConfig={demandConfig} />
         </div>
+        <p className="analysis-note ai-comment">💬 {demandComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("デマンド分析（日平均電力）",
+          seriesText(demandData.labels, demandData.values, "kW") + `\n契約電力: ${fmtNum(settings.contractKW, 0)}kW`)} />
         <div className="panel-title" style={{ marginTop: 16 }}>契約電力比の分布（日数）</div>
         <div className="chart-canvas-toolbar">
           <button className="btn btn-small" onClick={(e) => downloadChartCanvasImage(e.currentTarget.parentElement, "契約電力比の分布.png")}>🖼 画像保存</button>
@@ -2008,6 +2221,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         <div className="chart-canvas-wrap" style={{ height: 200 }}>
           <ChartCanvas key={`demh-${fy}-${darkMode}`} getConfig={demandHistConfig} height={180} />
         </div>
+        <p className="analysis-note ai-comment">💬 {demandHistComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("契約電力比の分布",
+          demandHistogram.bins.map((b) => `${b.label}: ${b.count}日`).join(" / "))} />
       </section>
 
       <section className="chart-panel">
@@ -2036,6 +2252,12 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
             <div className="chart-canvas-wrap">
               <ChartCanvas key={`overlay-${overlayYears.join(",")}-${overlayMetric}-${darkMode}`} getConfig={overlayConfig} />
             </div>
+            <p className="analysis-note ai-comment">💬 {overlayComment}</p>
+            <AiCommentBox buildPrompt={() => buildAnalysisPrompt(`複数年度重ね表示（${METRICS[overlayMetric].label}）`,
+              overlayYears.map((y) => {
+                const monthly = fiscalMonthKeys(y).map((ym) => data.filter((r) => r.date.startsWith(ym)));
+                return `${y}年度: ${fmtNum(sumMetric(monthly.flat(), overlayMetric), 0)} ${METRICS[overlayMetric].unit}`;
+              }).join(" / "))} />
           </React.Fragment>
         )}
       </section>
@@ -2058,6 +2280,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         <div className="chart-canvas-wrap">
           <ChartCanvas key={`sens-${sensitivityMetric}-${fiscalYears.join(",")}-${darkMode}`} getConfig={sensitivityConfig} />
         </div>
+        <p className="analysis-note ai-comment">💬 {sensitivityComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("気温感応度分析（年度別）",
+          sensitivity.byYear.map((x) => `${x.fy}年度: ${fmtNum(x.slope, 2)} ${sensitivity.meta.unit}/℃`).join(" / "))} />
       </section>
 
       <section className="chart-panel">
@@ -2074,6 +2299,8 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         <div className="chart-canvas-wrap">
           <ChartCanvas key={`wd-${fy}-${weekdayMetric}-${darkMode}`} getConfig={weekdayConfig} />
         </div>
+        <p className="analysis-note ai-comment">💬 {weekdayComment}</p>
+        <AiCommentBox buildPrompt={() => buildAnalysisPrompt(`曜日別パターン（${METRICS[weekdayMetric].label}）`, seriesText(WEEKDAY_LABELS, weekdayPattern, ""))} />
       </section>
 
       <section className="chart-panel">
@@ -2081,17 +2308,33 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         {cumulativeProgress.length === 0 ? (
           <div className="analysis-empty">年度目標が未設定です。「設定」画面から目標値を入力してください。</div>
         ) : (
-          cumulativeProgress.map((t) => (
-            <React.Fragment key={t.key}>
-              <div className="panel-title" style={{ marginTop: 8 }}>{t.label}</div>
-              <div className="chart-canvas-toolbar">
-                <button className="btn btn-small" onClick={(e) => downloadChartCanvasImage(e.currentTarget.parentElement, `累積進捗_${t.label}.png`)}>🖼 画像保存</button>
-              </div>
-              <div className="chart-canvas-wrap">
-                <ChartCanvas key={`cum-${t.key}-${fy}-${darkMode}`} getConfig={() => cumulativeConfig(t)} />
-              </div>
-            </React.Fragment>
-          ))
+          cumulativeProgress.map((t) => {
+            let lastActualIdx = -1;
+            t.actualSeries.forEach((v, i) => { if (v != null && data.some((r) => r.date.startsWith(monthKeys[i]))) lastActualIdx = i; });
+            const comment = lastActualIdx >= 0
+              ? (() => {
+                  const actual = t.actualSeries[lastActualIdx];
+                  const pace = t.paceSeries[lastActualIdx];
+                  const diff = pace > 0 ? ((actual - pace) / pace) * 100 : 0;
+                  const state = Math.abs(diff) < 3 ? "ほぼ目標ペース通り" : diff > 0 ? "目標ペースより進んでいます" : "目標ペースより遅れています";
+                  return `${FM_LABELS[lastActualIdx]}時点で累積${fmtNum(actual, 0)} ${t.unit}（目標ペース${fmtNum(pace, 0)} ${t.unit}に対して${state}、${fmtPct(diff)}）。`;
+                })()
+              : "データが不足しており判定できません。";
+            return (
+              <React.Fragment key={t.key}>
+                <div className="panel-title" style={{ marginTop: 8 }}>{t.label}</div>
+                <div className="chart-canvas-toolbar">
+                  <button className="btn btn-small" onClick={(e) => downloadChartCanvasImage(e.currentTarget.parentElement, `累積進捗_${t.label}.png`)}>🖼 画像保存</button>
+                </div>
+                <div className="chart-canvas-wrap">
+                  <ChartCanvas key={`cum-${t.key}-${fy}-${darkMode}`} getConfig={() => cumulativeConfig(t)} />
+                </div>
+                <p className="analysis-note ai-comment">💬 {comment}</p>
+                <AiCommentBox buildPrompt={() => buildAnalysisPrompt(`年間目標への累積進捗（${t.label}）`,
+                  seriesText(FM_LABELS, t.actualSeries, t.unit) + `\n目標ペース: ` + seriesText(FM_LABELS, t.paceSeries, t.unit))} />
+              </React.Fragment>
+            );
+          })
         )}
       </section>
     </div>
@@ -3026,7 +3269,12 @@ function App() {
         .analysis-fy-label { font-size:13px; color:#64748b; }
         .tabs select { padding:6px 10px; border-radius:8px; border:1px solid #cbd5e1; font-size:13px; }
         .analysis-note { font-size:12px; color:#64748b; margin:0 0 12px; }
+        .analysis-note.ai-comment { margin:12px 0 0; padding:10px 12px; background:#f8fafc; border-radius:8px; color:#334155; line-height:1.6; }
+        .ai-gemini-box { margin-top:8px; }
+        .analysis-note.ai-comment-error { background:#fef2f2; color:#b91c1c; }
         .analysis-empty { padding:24px; text-align:center; color:#94a3b8; font-size:13px; }
+        .granularity-toggle { display:flex; gap:4px; }
+        .granularity-toggle .btn.active { background:#2563eb; border-color:#2563eb; color:#fff; }
         .overlay-year-checks { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
         .anomaly-table { width:100%; border-collapse:collapse; font-size:12px; }
         .anomaly-table th, .anomaly-table td { padding:6px 10px; border-bottom:1px solid #f1f5f9; text-align:right; }
@@ -3144,6 +3392,8 @@ function App() {
         .app-shell[data-theme="dark"] .chart-header-toggle, .app-shell[data-theme="dark"] .analysis-note,
         .app-shell[data-theme="dark"] .kpi-period-sub, .app-shell[data-theme="dark"] .entry-cal-summary { color:#94a3b8; }
         .app-shell[data-theme="dark"] .kpi-period-label { color:#f1f5f9; }
+        .app-shell[data-theme="dark"] .analysis-note.ai-comment { background:#1e293b; color:#cbd5e1; }
+        .app-shell[data-theme="dark"] .analysis-note.ai-comment-error { background:#3f1d1d; color:#fecaca; }
         .app-shell[data-theme="dark"] .kpi-value, .app-shell[data-theme="dark"] .entry-form-label,
         .app-shell[data-theme="dark"] .entry-cal-title { color:#f1f5f9; }
         .app-shell[data-theme="dark"] input, .app-shell[data-theme="dark"] select, .app-shell[data-theme="dark"] textarea {

@@ -1,0 +1,82 @@
+// ============================================================
+// Gemini分析コメント用の中継スクリプト（Google Apps Script）
+// ------------------------------------------------------------
+// 使い方：
+// 1. https://script.google.com で「新しいプロジェクト」を作成
+// 2. デフォルトの Code.gs の中身を全部消して、このファイルの中身を貼り付ける
+// 3. 左メニューの歯車アイコン「プロジェクトの設定」→ 下の方の「スクリプト プロパティ」で
+//    プロパティ「GEMINI_API_KEY」を追加し、値に Google AI Studio(aistudio.google.com) で
+//    発行したAPIキーを貼り付けて保存
+// 4. 右上の「デプロイ」→「新しいデプロイ」→ 種類の選択で歯車アイコン→「ウェブアプリ」を選択
+//    - 説明：任意（例：gemini-proxy）
+//    - 次のユーザーとして実行：自分
+//    - アクセスできるユーザー：全員
+//    → 「デプロイ」をクリックし、承認画面が出たら自分のアカウントで許可する
+// 5. 発行された「ウェブアプリURL」（https://script.google.com/macros/s/.../exec）をコピーし、
+//    energy-dashboard-app の app.jsx 内の GEMINI_PROXY_URL 定数に貼り付けてもらう
+//    （このファイル自体はコピー先のApps Scriptプロジェクト用なので、energy-dashboard-app
+//    本体のリポジトリには含めない）
+//
+// 注意：コードを修正した場合は、単に保存するだけでなく「デプロイを管理」→ 該当のデプロイの
+// 鉛筆アイコン→ バージョン「新バージョン」を選んで「デプロイ」し直さないと、公開URL側には
+// 反映されません。
+// ============================================================
+
+function doPost(e) {
+  try {
+    var body = JSON.parse(e.postData.contents);
+    var prompt = body.prompt;
+    if (!prompt) {
+      return jsonResponse({ error: "prompt が指定されていません。" });
+    }
+
+    var apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+    if (!apiKey) {
+      return jsonResponse({ error: "GEMINI_API_KEY が設定されていません（スクリプト プロパティを確認してください）。" });
+    }
+
+    // モデル名は Google AI Studio (aistudio.google.com) で使えるものに合わせて調整してください。
+    // gemini-2.0-flash は無料枠のクォータが0（利用不可）というアカウントがあるため、
+    // 無料枠での実績が安定している gemini-1.5-flash をデフォルトにしている。
+    // それでもエラーになる場合は、AI StudioのAPIキー画面や
+    // https://ai.google.dev/gemini-api/docs/rate-limits で、自分のアカウントで
+    // 実際に無料枠が使えるモデル名を確認して置き換えること。
+    var model = "gemini-1.5-flash";
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
+
+    var payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+    };
+    var options = {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    };
+
+    var response = UrlFetchApp.fetch(url, options);
+    var status = response.getResponseCode();
+    var json = JSON.parse(response.getContentText());
+
+    if (status !== 200) {
+      var msg = (json.error && json.error.message) ? json.error.message : ("Gemini APIエラー (" + status + ")");
+      return jsonResponse({ error: msg });
+    }
+
+    var text =
+      json.candidates &&
+      json.candidates[0] &&
+      json.candidates[0].content &&
+      json.candidates[0].content.parts &&
+      json.candidates[0].content.parts[0] &&
+      json.candidates[0].content.parts[0].text;
+
+    return jsonResponse({ comment: (text || "").trim() });
+  } catch (err) {
+    return jsonResponse({ error: String(err) });
+  }
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
