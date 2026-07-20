@@ -3104,6 +3104,17 @@ function App() {
                   active={!!charts[0] && charts[0].selectedMetrics.includes("costYen")} onClick={() => toggleMetricInFirstChart("costYen")} />
               </div>
               {charts[0] && <div className="combined-chart-wrap">{renderChartBody(charts[0], true)}</div>}
+              <AiCommentBox buildPrompt={() => buildAnalysisPrompt(
+                `${kpiLabel}の${view === "day" ? "月次" : "年間"}実績分析`,
+                kpiList.map((k) => `${k.label}: ${fmtNum(k.current, 1)}${k.unit}` + (k.pct != null ? `（前期比${k.pct >= 0 ? "+" : ""}${fmtNum(k.pct, 1)}%）` : ""))
+                  .concat([
+                    `総合熱源効率: ${fmtNum(efficiency.ratio, 1)}%`,
+                    `CO2排出量: ${fmtNum(efficiency.co2, 1)}t-CO2`,
+                    `概算コスト: ${fmtNum(efficiency.costYen, 0)}円`,
+                  ])
+                  .concat(peak ? [`日平均電力ピーク: ${fmtNum(peak.demandKW, 1)}kW（${peak.date}／契約比${fmtNum((peak.demandKW / settings.contractKW) * 100, 0)}%）`] : [])
+                  .join(" / ")
+              )} />
             </section>
 
             {charts.slice(1).map((chart) => (
@@ -3162,7 +3173,7 @@ function App() {
       )}
 
       <style>{`
-        .app-shell { max-width: 1280px; margin: 0 auto; padding: 16px 20px 60px; }
+        .app-shell { max-width: 1280px; margin: 0 auto; padding: 16px calc(20px + env(safe-area-inset-right)) calc(60px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left)); }
         .app-header { padding:14px 20px; background:#0f172a; color:#fff; border-radius:12px; margin-bottom:16px; }
         .app-title-row { margin-bottom:12px; display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
         .app-title { font-size:18px; font-weight:700; }

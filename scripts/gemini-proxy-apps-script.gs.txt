@@ -36,12 +36,12 @@ function doPost(e) {
     }
 
     // モデル名は Google AI Studio (aistudio.google.com) で使えるものに合わせて調整してください。
-    // gemini-2.0-flash は無料枠のクォータが0（利用不可）というアカウントがあるため、
-    // 無料枠での実績が安定している gemini-1.5-flash をデフォルトにしている。
-    // それでもエラーになる場合は、AI StudioのAPIキー画面や
-    // https://ai.google.dev/gemini-api/docs/rate-limits で、自分のアカウントで
-    // 実際に無料枠が使えるモデル名を確認して置き換えること。
-    var model = "gemini-1.5-flash";
+    // gemini-2.0-flash はクォータ0、gemini-1.5-flashは廃止済み、gemini-2.5-flashは
+    // 新規ユーザーには提供終了、というアカウントがあったため、常に現行モデルを指す
+    // エイリアス gemini-flash-latest をデフォルトにしている。
+    // それでもエラーになる場合は、このファイル内の listModels() 関数を実行し、
+    // 実行ログに出力される一覧から実際に使えるモデル名を確認して置き換えること。
+    var model = "gemini-flash-latest";
     var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
 
     var payload = {
@@ -79,4 +79,30 @@ function doPost(e) {
 
 function jsonResponse(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================================
+// 動作確認用（一時的に使う関数）：
+// このAPIキーで実際に使えるモデル一覧を調べたいときに使う。
+// 使い方：
+// 1. 上のエディタにこの関数を追記して保存
+// 2. 画面上部の関数選択ドロップダウン（doPost と表示されている部分）で
+//    「listModels」を選び、「実行」ボタンを押す
+// 3. 左メニューの時計アイコン「実行ログ」を開くと、
+//    generateContent に対応しているモデル名の一覧が出力される
+// 確認が終わったらこの関数は削除してよい（doPostの動作には影響しない）。
+// ============================================================
+function listModels() {
+  var apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  var url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + apiKey;
+  var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  var json = JSON.parse(response.getContentText());
+  var lines = [];
+  (json.models || []).forEach(function (m) {
+    var methods = m.supportedGenerationMethods || [];
+    if (methods.indexOf("generateContent") !== -1) {
+      lines.push(m.name);
+    }
+  });
+  Logger.log(lines.join("\n"));
 }
