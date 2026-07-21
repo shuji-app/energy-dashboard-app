@@ -263,11 +263,62 @@ async function fetchGeminiComment(prompt) {
   if (data.error) throw new Error(data.error);
   return data.comment || "(コメントを取得できませんでした)";
 }
-function buildAnalysisPrompt(title, dataText) {
-  return `あなたは工場設備のエネルギー管理の専門家です。次のデータについて、200字程度の日本語で実務的な分析コメントを1つだけ書いてください。数値の解説だけでなく、可能なら改善のヒントも添えてください。前置きや見出しは不要で、コメント本文だけを返してください。\n\n【${title}】\n${dataText}`;
+
+// 中央監視画面（PDF/JPEG/PNG）をGeminiのマルチモーダル入力として渡し、画像/文書の内容を分析してもらう。
+// dataUrlは "data:<mimeType>;base64,<data>" 形式の文字列を想定（monitorGetFileDataUrlの戻り値）。
+async function fetchGeminiImageComment(prompt, dataUrl, mimeType) {
+  if (!GEMINI_PROXY_URL || GEMINI_PROXY_URL === "YOUR_APPS_SCRIPT_WEB_APP_URL") {
+    throw new Error("Apps ScriptのURLが未設定です（app.jsx内のGEMINI_PROXY_URLを設定してください）。");
+  }
+  const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  const res = await fetch(GEMINI_PROXY_URL, {
+    method: "POST",
+    body: JSON.stringify({
+      prompt,
+      imageBase64: base64,
+      imageMimeType: mimeType || "image/jpeg"
+    })
+  });
+  if (!res.ok) throw new Error(`通信エラー（${res.status}）`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.comment || "(コメントを取得できませんでした)";
+}
+
+// 中央監視画面1枚を単体で分析させるプロンプト。
+function buildMonitorImagePrompt(dateStr, fileName) {
+  return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}の中央監視装置の画面（${fileName}）です。表示されている数値・稼働状態・警報表示などを読み取り、注意すべき点や異常の兆候があれば日本語で150字程度で指摘してください。画像/文書から内容が読み取れない場合はその旨を述べてください。`;
+}
+// 複数画面それぞれの個別分析結果を踏まえて、その日全体としての総括をさせるプロンプト（テキストのみ）。
+function buildMonitorSummaryPrompt(dateStr, perFileComments) {
+  return `あなたは工場設備のエネルギー管理の専門家です。以下は${dateStr}に取り込まれた中央監視装置の複数の画面について、それぞれ個別に分析した結果です。\n\n${perFileComments.join("\n")}\n\nこれらを踏まえて、その日の設備全体としての状態を200字程度の日本語でまとめてください。画面間で関連する異常や矛盾があれば特に指摘してください。`;
+}
+function buildAnalysisPrompt(title, dataText, extraInstruction) {
+  return `あなたは工場設備のエネルギー管理の専門家です。次のデータについて、200字程度の日本語で実務的な分析コメントを1つだけ書いてください。数値の解説だけでなく、可能なら改善のヒントも添えてください。前置きや見出しは不要で、コメント本文だけを返してください。\n\n【${title}】\n${dataText}${extraInstruction ? "\n\n" + extraInstruction : ""}`;
 }
 function seriesText(labels, values, unit) {
   return labels.map((l, i) => `${l}: ${values[i] != null ? fmtNum(values[i], 2) + unit : "欠測"}`).join(" / ");
+}
+
+// GeminiにKPIの数値分析と合わせて「グラフ化すると役立つ項目の組み合わせ」を提案してもらうための
+// 追加指示文。回答の末尾1行だけに機械可読な形式で書かせ、それ以外の行はコメント本文として表示する。
+function buildChartSuggestionInstruction() {
+  const keyList = Object.entries(METRICS).map(([k, v]) => `${k}(${v.label})`).join("、");
+  return `さらに、分析コメントとは別に、グラフとして並べて見ると特に参考になりそうな項目を2〜3個提案してください。` + `回答の一番最後の行にだけ、次の形式で書いてください（この行に説明文を混ぜないこと）：\n` + `SUGGEST_CHART: キー1,キー2\n` + `使用できるキー: ${keyList}`;
+}
+// Geminiの回答文字列から末尾の "SUGGEST_CHART: ..." 行を取り出し、本文コメントと分離する。
+function parseChartSuggestion(rawText) {
+  const m = rawText.match(/SUGGEST_CHART:\s*([^\n]+)\s*$/i);
+  if (!m) return {
+    comment: rawText.trim(),
+    suggestedKeys: null
+  };
+  const keys = m[1].split(/[,、]/).map(s => s.trim()).filter(k => METRICS[k]);
+  const comment = rawText.slice(0, m.index).trim();
+  return {
+    comment,
+    suggestedKeys: keys.length ? keys : null
+  };
 }
 
 // Firebaseへの書き込みは、状態の変化を監視するeffectではなく、実際にユーザーが保存操作をした
@@ -362,10 +413,11 @@ function withComputed(row, settings) {
 // 次回起動時にも同じファイルへ書き込み続けられるようにする。
 // ============================================================
 const IDB_NAME = "energyAppFS";
-const IDB_VERSION = 2;
+const IDB_VERSION = 3;
 const IDB_STORE = "handles";
 const IDB_KEY = "autoSaveFile";
-const IDB_MONITOR_STORE = "monitorFiles";
+const IDB_MONITOR_STORE = "monitorFiles"; // 旧形式（1日1ファイル）。読み書きはしないがストア自体は残す。
+const IDB_MONITOR_STORE_V2 = "monitorFilesV2"; // 新形式（1日に複数ファイル）。keyPathは"date__fileId"。
 function idbOpen() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(IDB_NAME, IDB_VERSION);
@@ -375,6 +427,14 @@ function idbOpen() {
       if (!dbInst.objectStoreNames.contains(IDB_MONITOR_STORE)) dbInst.createObjectStore(IDB_MONITOR_STORE, {
         keyPath: "date"
       });
+      if (!dbInst.objectStoreNames.contains(IDB_MONITOR_STORE_V2)) {
+        const store = dbInst.createObjectStore(IDB_MONITOR_STORE_V2, {
+          keyPath: "id"
+        });
+        store.createIndex("date", "date", {
+          unique: false
+        });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -408,14 +468,18 @@ async function idbClearHandle() {
   });
 }
 
-// 中央監視装置の熱源画面（PDF/JPEG/PNG）を日付ごとに保管する。この端末のIndexedDBのみに
-// 保存され、Firebase等では同期されない（1画面あたり数MBになり得るため、まずはローカル保存のみ）。
-async function idbSaveMonitorFile(dateStr, file) {
+// 中央監視装置の熱源画面（PDF/JPEG/PNG）を日付ごとに保管する。Firebaseが使えるなら
+// Realtime Databaseで他端末とも共有し、使えない場合のみこの端末のIndexedDBにのみ保存する
+// （monitorSyncEnabledで自動的に切り替わる。呼び出し側はどちらか意識しなくてよい）。
+// 1日に複数ファイルを保管できるよう、日付＋ファイルID（fileId）の組み合わせをキーにする。
+async function idbSaveMonitorFile(dateStr, fileId, file) {
   const dbInst = await idbOpen();
   return new Promise((resolve, reject) => {
-    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readwrite");
-    tx.objectStore(IDB_MONITOR_STORE).put({
+    const tx = dbInst.transaction(IDB_MONITOR_STORE_V2, "readwrite");
+    tx.objectStore(IDB_MONITOR_STORE_V2).put({
+      id: dateStr + "__" + fileId,
       date: dateStr,
+      fileId,
       fileName: file.name,
       fileType: file.type,
       blob: file,
@@ -425,20 +489,20 @@ async function idbSaveMonitorFile(dateStr, file) {
     tx.onerror = () => reject(tx.error);
   });
 }
-async function idbGetMonitorFile(dateStr) {
+async function idbGetMonitorFile(dateStr, fileId) {
   const dbInst = await idbOpen();
   return new Promise((resolve, reject) => {
-    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readonly");
-    const req = tx.objectStore(IDB_MONITOR_STORE).get(dateStr);
+    const tx = dbInst.transaction(IDB_MONITOR_STORE_V2, "readonly");
+    const req = tx.objectStore(IDB_MONITOR_STORE_V2).get(dateStr + "__" + fileId);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error);
   });
 }
-async function idbDeleteMonitorFile(dateStr) {
+async function idbDeleteMonitorFile(dateStr, fileId) {
   const dbInst = await idbOpen();
   return new Promise((resolve, reject) => {
-    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readwrite");
-    tx.objectStore(IDB_MONITOR_STORE).delete(dateStr);
+    const tx = dbInst.transaction(IDB_MONITOR_STORE_V2, "readwrite");
+    tx.objectStore(IDB_MONITOR_STORE_V2).delete(dateStr + "__" + fileId);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -446,22 +510,24 @@ async function idbDeleteMonitorFile(dateStr) {
 async function idbListMonitorFiles() {
   const dbInst = await idbOpen();
   return new Promise((resolve, reject) => {
-    const tx = dbInst.transaction(IDB_MONITOR_STORE, "readonly");
-    const req = tx.objectStore(IDB_MONITOR_STORE).getAll();
+    const tx = dbInst.transaction(IDB_MONITOR_STORE_V2, "readonly");
+    const req = tx.objectStore(IDB_MONITOR_STORE_V2).getAll();
     req.onsuccess = () => {
       // 一覧表示ではblob本体は不要なので除いて返す（メモリ節約）
       const list = (req.result || []).map(({
         date,
+        fileId,
         fileName,
         fileType,
         uploadedAt
       }) => ({
         date,
+        fileId,
         fileName,
         fileType,
         uploadedAt
       }));
-      resolve(list.sort((a, b) => a.date < b.date ? 1 : -1));
+      resolve(list.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.uploadedAt || 0) - (b.uploadedAt || 0)));
     };
     req.onerror = () => reject(req.error);
   });
@@ -473,6 +539,8 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))]);
 }
 const MONITOR_FILE_MAX_BYTES = 8 * 1024 * 1024; // Realtime Databaseの無料枠を圧迫しすぎないよう8MBを目安に制限
+const MONITOR_IMAGE_MAX_DIM = 1600; // 長辺をこのピクセル数まで縮小（監視画面の数値が読み取れる範囲を想定）
+const MONITOR_IMAGE_QUALITY = 0.75; // JPEG圧縮品質
 
 function fileToDataUrl(file) {
   return new Promise((resolve, reject) => {
@@ -483,51 +551,110 @@ function fileToDataUrl(file) {
   });
 }
 
+// 1日に複数ファイルを保管できるよう、各ファイルを識別するIDを発行する（日付内で一意であればよい）。
+function genMonitorFileId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// 画像ファイルを指定の長辺サイズ・JPEG品質に圧縮する。iPadのカメラ撮影画像は数MB〜十数MBに
+// なりがちで、複数枚×毎日保存するとRealtime Databaseの無料枠（1GB）をすぐ圧迫してしまうため、
+// アップロード前に必ず縮小する。PDFは圧縮できないのでそのまま返す。
+function compressImageFile(file, maxDim, quality) {
+  if (!file.type.startsWith("image/")) return Promise.resolve(file);
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      let {
+        width,
+        height
+      } = img;
+      if (width > height && width > maxDim) {
+        height = Math.round(height * maxDim / width);
+        width = maxDim;
+      } else if (height >= width && height > maxDim) {
+        width = Math.round(width * maxDim / height);
+        height = maxDim;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      canvas.toBlob(blob => {
+        if (!blob) {
+          reject(new Error("画像の圧縮に失敗しました。"));
+          return;
+        }
+        resolve(new File([blob], file.name.replace(/\.\w+$/, "") + ".jpg", {
+          type: "image/jpeg"
+        }));
+      }, "image/jpeg", quality);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("画像の読み込みに失敗しました。"));
+    };
+    img.src = objectUrl;
+  });
+}
+
 // monitorSyncEnabled(=Realtime Databaseが使える)なら他端末とも共有される保存先
 // （Realtime Databaseにbase64文字列として保存）を使い、そうでなければこの端末の
 // IndexedDBだけで完結させる。呼び出し側（コンポーネント）はどちらが使われているか
-// 意識しなくてよいようにラップしている。
-async function monitorSaveFile(dateStr, file) {
+// 意識しなくてよいようにラップしている。1日に複数ファイルを持てるよう、日付ごとに
+// fileIdをキーとしたマップとして保存する。
+async function monitorSaveFile(dateStr, fileId, file) {
   if (monitorSyncEnabled) {
     if (file.size > MONITOR_FILE_MAX_BYTES) {
       throw new Error(`ファイルサイズが大きすぎます（${MONITOR_FILE_MAX_BYTES / 1024 / 1024}MB以下にしてください）。`);
     }
     const dataUrl = await fileToDataUrl(file);
-    await withTimeout(db.ref("monitorFileBlobs/" + dateStr).set(dataUrl), 15000, "保存がタイムアウトしました。Realtime Databaseのルールに monitorFileBlobs / monitorFilesMeta が含まれているかご確認ください。");
-    await db.ref("monitorFilesMeta/" + dateStr).set({
+    await withTimeout(db.ref("monitorFileBlobs/" + dateStr + "/" + fileId).set(dataUrl), 15000, "保存がタイムアウトしました。Realtime Databaseのルールに monitorFileBlobs / monitorFilesMeta が含まれているかご確認ください。");
+    await db.ref("monitorFilesMeta/" + dateStr + "/" + fileId).set({
       fileName: file.name,
       fileType: file.type,
       uploadedAt: Date.now()
     });
   } else {
-    await idbSaveMonitorFile(dateStr, file);
+    await idbSaveMonitorFile(dateStr, fileId, file);
   }
 }
-async function monitorDeleteFile(dateStr) {
+async function monitorDeleteFile(dateStr, fileId) {
   if (monitorSyncEnabled) {
-    await db.ref("monitorFileBlobs/" + dateStr).remove();
-    await db.ref("monitorFilesMeta/" + dateStr).remove();
+    await db.ref("monitorFileBlobs/" + dateStr + "/" + fileId).remove();
+    await db.ref("monitorFilesMeta/" + dateStr + "/" + fileId).remove();
   } else {
-    await idbDeleteMonitorFile(dateStr);
+    await idbDeleteMonitorFile(dateStr, fileId);
   }
 }
 // プレビュー用のURLを返す。Firebase同期時はdata URL文字列（revoke不要）、
 // IndexedDB利用時はBlobから作ったオブジェクトURL（呼び出し側でrevoke必須）を返す。
-async function monitorGetPreviewSrc(dateStr) {
+async function monitorGetPreviewSrc(dateStr, fileId) {
   if (monitorSyncEnabled) {
-    const snap = await withTimeout(db.ref("monitorFileBlobs/" + dateStr).once("value"), 15000, "読み込みがタイムアウトしました。");
+    const snap = await withTimeout(db.ref("monitorFileBlobs/" + dateStr + "/" + fileId).once("value"), 15000, "読み込みがタイムアウトしました。");
     if (!snap.exists()) return null;
     return {
       url: snap.val(),
       revoke: false
     };
   }
-  const rec = await idbGetMonitorFile(dateStr);
+  const rec = await idbGetMonitorFile(dateStr, fileId);
   if (!rec) return null;
   return {
     url: URL.createObjectURL(rec.blob),
     revoke: true
   };
+}
+// Gemini画像分析用に、表示方法（data URL/オブジェクトURL）によらず必ずbase64のdata URLを返す。
+async function monitorGetFileDataUrl(dateStr, fileId) {
+  if (monitorSyncEnabled) {
+    const snap = await withTimeout(db.ref("monitorFileBlobs/" + dateStr + "/" + fileId).once("value"), 15000, "読み込みがタイムアウトしました。");
+    return snap.exists() ? snap.val() : null;
+  }
+  const rec = await idbGetMonitorFile(dateStr, fileId);
+  if (!rec) return null;
+  return fileToDataUrl(rec.blob);
 }
 function loadInitialData() {
   try {
@@ -682,31 +809,43 @@ function trendInsight(labels, values, unit, digits = 1) {
   return s;
 }
 function historicalAvgTempForCalendarDay(rows, monthDay) {
-  const vals = rows.filter(r => r.date.slice(5) === monthDay).map(r => r.tempAvg).filter(v => v != null);
+  const vals = rows.filter(r => r.date.slice(5) === monthDay).map(r => r.tempAvg).filter(v => v != null && !isNaN(v));
   if (!vals.length) return null;
   return vals.reduce((a, b) => a + b, 0) / vals.length;
 }
 
-// 月内の残り日数を予測する（日ビューの月末着地予測に使用）
-function computeMonthForecast(allRows, ym, key, method) {
+// 月内の残り日数を予測する（日ビューの月末着地予測に使用）。実績が1件も無い月でも、
+// 「まだ来ていない（最新実績日より後の）月」であれば、過去の実績・気象データだけをもとに
+// その月を丸ごと予測する。ただし過去の月に実績が全く無い場合はデータ欠落の可能性があるため、
+// 憶測で埋めない（3.2節のデータ破損対応と同じ方針）。latestDateは最新実績日（省略可、
+// 省略時は「実績が1件も無い月は予測しない」という従来通りの安全側の挙動になる）。
+function computeMonthForecast(allRows, ym, key, method, latestDate) {
   const dim = daysInMonth(ym);
   const monthRows = allRows.filter(r => r.date.startsWith(ym)).sort((a, b) => a.date < b.date ? -1 : 1);
   const actualDates = new Set(monthRows.map(r => r.date));
   const allDates = [];
   for (let d = 1; d <= dim; d++) allDates.push(`${ym}-${String(d).padStart(2, "0")}`);
   const missingDates = allDates.filter(d => !actualDates.has(d));
-  if (missingDates.length === 0 || monthRows.length === 0) return null;
+  if (missingDates.length === 0) return null;
+  if (monthRows.length === 0) {
+    const latestYm = latestDate ? latestDate.slice(0, 7) : null;
+    if (!latestYm || ym <= latestYm) return null; // 過去の欠測は補正しない
+  }
   const actualSum = sumMetric(monthRows, key);
   const [y, m] = ym.split("-").map(Number);
   const lastYearYm = `${y - 1}-${String(m).padStart(2, "0")}`;
+  const lastYearRows = allRows.filter(r => r.date.startsWith(lastYearYm));
   const lastYearByDay = {};
-  allRows.filter(r => r.date.startsWith(lastYearYm)).forEach(r => {
+  lastYearRows.forEach(r => {
     lastYearByDay[Number(r.date.split("-")[2])] = r[key];
   });
+  // 当月の実績が1件も無い場合のフォールバック：前年同月の1日あたり平均、それも無ければ全実績の平均。
+  const lastYearMonthAvgPerDay = lastYearRows.length ? sumMetric(lastYearRows, key) / lastYearRows.length : null;
+  const overallAvgPerDay = allRows.length ? sumMetric(allRows, key) / allRows.length : 0;
   const matchedLastYearSoFar = monthRows.map(r => lastYearByDay[Number(r.date.split("-")[2])]).filter(v => v != null);
   const lastYearSoFarSum = matchedLastYearSoFar.reduce((a, b) => a + b, 0);
-  const ratio = lastYearSoFarSum > 0 ? actualSum / lastYearSoFarSum : 1;
-  const paceAvgPerDay = actualSum / monthRows.length;
+  const ratio = monthRows.length > 0 && lastYearSoFarSum > 0 ? actualSum / lastYearSoFarSum : 1;
+  const paceAvgPerDay = monthRows.length > 0 ? actualSum / monthRows.length : lastYearMonthAvgPerDay != null ? lastYearMonthAvgPerDay : overallAvgPerDay;
   const reg = buildRegression(allRows, key);
   const forecastPoints = missingDates.map(dateStr => {
     const day = Number(dateStr.split("-")[2]);
@@ -722,7 +861,7 @@ function computeMonthForecast(allRows, ym, key, method) {
     }
     return {
       date: dateStr,
-      value: Math.max(0, value)
+      value: value != null && !isNaN(value) ? Math.max(0, value) : 0
     };
   });
   const forecastSum = forecastPoints.reduce((s, p) => s + p.value, 0);
@@ -755,8 +894,13 @@ function computeFiscalYearForecast(allRows, fy, key, method, latestDate) {
   // その月だけ末尾を予測、それより後の月は「未来（丸ごと予測）」として扱う。
   const latestYm = latestDate ? latestDate.slice(0, 7) : null;
   let currentIdx = monthKeys.indexOf(latestYm);
-  if (currentIdx === -1) currentIdx = monthKeys.length; // 対象年度にlatestDateが無ければ全月を過去扱い
-
+  if (currentIdx === -1) {
+    const latestFY = latestDate ? fiscalYear(latestDate) : null;
+    // 対象年度が最新実績よりまだ先（=丸ごと未来の年度）なら、全月を「未来」として予測対象にする。
+    // 過去の年度に実績が無いのはデータ欠落の可能性があるため、その場合は補正しない
+    // （従来通り全月を過去扱いにして、予測は出さない）。
+    currentIdx = latestFY != null && fy > latestFY ? -1 : monthKeys.length;
+  }
   let soFarThisFY = 0;
   let forecastRemaining = 0;
   let hasForecast = false;
@@ -771,7 +915,7 @@ function computeFiscalYearForecast(allRows, fy, key, method, latestDate) {
       monthsElapsed += 1;
       byIndex[idx] = m.sum;
     } else if (idx === currentIdx) {
-      const mf = computeMonthForecast(allRows, m.ym, key, method);
+      const mf = computeMonthForecast(allRows, m.ym, key, method, latestDate);
       if (mf) {
         soFarThisFY += mf.actualSum;
         forecastRemaining += mf.forecastSum;
@@ -787,7 +931,11 @@ function computeFiscalYearForecast(allRows, fy, key, method, latestDate) {
   });
   const soFarLastFYSum = sumMetric(allRows.filter(r => matchedPrevYm.includes(r.date.slice(0, 7))), key);
   const ratio = soFarLastFYSum > 0 ? soFarThisFY / soFarLastFYSum : 1;
-  const paceAvgPerMonth = monthsElapsed > 0 ? soFarThisFY / monthsElapsed : 0;
+  // 今年度の実績がまだ1ヶ月も無い（丸ごと未来の年度を見ている）場合のフォールバック：
+  // 前年度全体の月平均を使う。
+  const lastFYFullSum = sumMetric(allRows.filter(r => prevMonthKeys.includes(r.date.slice(0, 7))), key);
+  const lastFYMonthsWithData = prevMonthKeys.filter(pym => allRows.some(r => r.date.startsWith(pym))).length;
+  const paceAvgPerMonth = monthsElapsed > 0 ? soFarThisFY / monthsElapsed : lastFYMonthsWithData > 0 ? lastFYFullSum / lastFYMonthsWithData : 0;
   const futureMonths = monthly.filter((m, idx) => idx > currentIdx);
   if (futureMonths.length > 0) hasForecast = true;
   let futureSum = 0;
@@ -1092,9 +1240,10 @@ function buildYearViewBuckets(allRows) {
 // グラフごとに異なる予測方式・対象項目を指定できるよう、予測計算はバケット構築と分離する
 function computeForecastMap(allRows, view, selectedYm, selectedFY, forecastMethod, forecastMetrics) {
   const forecast = {};
+  const latestDate = allRows.length ? allRows[allRows.length - 1].date : null;
   if (view === "day") {
     forecastMetrics.forEach(key => {
-      const mf = computeMonthForecast(allRows, selectedYm, key, forecastMethod);
+      const mf = computeMonthForecast(allRows, selectedYm, key, forecastMethod, latestDate);
       if (mf) {
         const byIndex = {};
         mf.forecastPoints.forEach(p => {
@@ -1109,7 +1258,7 @@ function computeForecastMap(allRows, view, selectedYm, selectedFY, forecastMetho
     });
   } else if (view === "month") {
     forecastMetrics.forEach(key => {
-      const ff = computeFiscalYearForecast(allRows, selectedFY, key, forecastMethod, allRows.length ? allRows[allRows.length - 1].date : null);
+      const ff = computeFiscalYearForecast(allRows, selectedFY, key, forecastMethod, latestDate);
       if (ff && ff.hasForecast) {
         const byIndex = {};
         ff.monthly.forEach((m, i) => {
@@ -1858,10 +2007,9 @@ function DataEntryView({
   const [showMonitorList, setShowMonitorList] = useState(false);
   const [previewMonitorDate, setPreviewMonitorDate] = useState(null);
   const monitorDateSet = useMemo(() => new Set(monitorFiles.map(f => f.date)), [monitorFiles]);
-  const previewMonitorMeta = previewMonitorDate ? monitorFiles.find(f => f.date === previewMonitorDate) : null;
-  const handleDeleteMonitorFile = dateStr => {
-    onDeleteMonitorFile(dateStr);
-    setPreviewMonitorDate(null);
+  const previewMonitorFiles = useMemo(() => previewMonitorDate ? monitorFiles.filter(f => f.date === previewMonitorDate) : [], [monitorFiles, previewMonitorDate]);
+  const handleDeleteMonitorFile = (dateStr, fileId) => {
+    onDeleteMonitorFile(dateStr, fileId);
   };
   const missingDays = useMemo(() => {
     if (!data.length) return [];
@@ -2050,7 +2198,7 @@ function DataEntryView({
     onDelete: handleDeleteMonitorFile
   }), previewMonitorDate && /*#__PURE__*/React.createElement(MonitorPreviewModal, {
     date: previewMonitorDate,
-    fileMeta: previewMonitorMeta,
+    files: previewMonitorFiles,
     onClose: () => setPreviewMonitorDate(null),
     onDelete: handleDeleteMonitorFile
   }));
@@ -2125,35 +2273,73 @@ function MonitorImportModal({
 }) {
   const [date, setDate] = useState(defaultDate);
   const [status, setStatus] = useState("");
-  const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedFiles, setSelectedFiles] = useState([]); // [{tempId, file, status: compressing|ready|error, errorMsg}]
   const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const fileRef = useRef(null);
-  const acceptFile = file => {
-    if (!file) return;
-    if (!MONITOR_FILE_TYPES.includes(file.type)) {
-      setStatus("PDF・JPEG・PNGのみアップロードできます。");
-      return;
-    }
-    setSelectedFile(file);
-    setStatus("");
+  const cameraRef = useRef(null);
+  const acceptFiles = fileList => {
+    const files = Array.from(fileList || []);
+    files.forEach(async file => {
+      if (!MONITOR_FILE_TYPES.includes(file.type)) {
+        setStatus(`${file.name}: PDF・JPEG・PNGのみアップロードできます。`);
+        return;
+      }
+      const tempId = genMonitorFileId();
+      setSelectedFiles(prev => [...prev, {
+        tempId,
+        file,
+        status: "compressing"
+      }]);
+      try {
+        const processed = await compressImageFile(file, MONITOR_IMAGE_MAX_DIM, MONITOR_IMAGE_QUALITY);
+        if (processed.size > MONITOR_FILE_MAX_BYTES) {
+          setSelectedFiles(prev => prev.map(f => f.tempId === tempId ? {
+            ...f,
+            status: "error",
+            errorMsg: "圧縮後もサイズが大きすぎます"
+          } : f));
+          return;
+        }
+        setSelectedFiles(prev => prev.map(f => f.tempId === tempId ? {
+          ...f,
+          file: processed,
+          status: "ready"
+        } : f));
+      } catch (e) {
+        setSelectedFiles(prev => prev.map(f => f.tempId === tempId ? {
+          ...f,
+          status: "error",
+          errorMsg: e.message
+        } : f));
+      }
+    });
   };
+  const removeSelected = tempId => setSelectedFiles(prev => prev.filter(f => f.tempId !== tempId));
+  const readyFiles = selectedFiles.filter(f => f.status === "ready");
   const handleUpload = async () => {
     if (!date) {
       setStatus("対象日を選択してください。");
       return;
     }
-    if (!selectedFile) {
+    if (!readyFiles.length) {
       setStatus("ファイルを選択してください。");
       return;
     }
+    setUploading(true);
     try {
-      await monitorSaveFile(date, selectedFile);
-      setStatus(`${date} に保存しました（データ入力画面のカレンダーからプレビューできます）。`);
-      setSelectedFile(null);
+      for (const f of readyFiles) {
+        await monitorSaveFile(date, genMonitorFileId(), f.file);
+      }
+      setStatus(`${date} に${readyFiles.length}枚保存しました（データ入力画面のカレンダーからプレビューできます）。`);
+      setSelectedFiles([]);
       if (fileRef.current) fileRef.current.value = "";
+      if (cameraRef.current) cameraRef.current.value = "";
       onUploaded();
     } catch (e) {
       setStatus("保存エラー: " + e.message);
+    } finally {
+      setUploading(false);
     }
   };
   return /*#__PURE__*/React.createElement("div", {
@@ -2164,7 +2350,7 @@ function MonitorImportModal({
     onClick: e => e.stopPropagation()
   }, /*#__PURE__*/React.createElement("h3", null, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\u53D6\u308A\u8FBC\u307F"), /*#__PURE__*/React.createElement("p", {
     className: "modal-note"
-  }, "\u4E2D\u592E\u76E3\u8996\u88C5\u7F6E\u306E\u71B1\u6E90\u753B\u9762\uFF08PDF\u30FBJPEG\u30FBPNG\uFF09\u3092\u65E5\u4ED8\u3054\u3068\u306B\u53D6\u308A\u8FBC\u307F\u307E\u3059\u3002", monitorSyncEnabled ? "Firebaseに保存され、他端末とも共有されます。" : "この端末（ブラウザ）内にのみ保存されます。", "\u300C\u30C7\u30FC\u30BF\u5165\u529B\u300D\u753B\u9762\u306E\u30AB\u30EC\u30F3\u30C0\u30FC\u304B\u3089\u30D7\u30EC\u30D3\u30E5\u30FC\u3067\u304D\u307E\u3059\u3002"), /*#__PURE__*/React.createElement("div", {
+  }, "\u4E2D\u592E\u76E3\u8996\u88C5\u7F6E\u306E\u71B1\u6E90\u753B\u9762\uFF08PDF\u30FBJPEG\u30FBPNG\u3001\u8907\u6570\u53EF\uFF09\u3092\u65E5\u4ED8\u3054\u3068\u306B\u53D6\u308A\u8FBC\u307F\u307E\u3059\u3002\u753B\u50CF\u306F\u81EA\u52D5\u7684\u306B \u5727\u7E2E\u30FB\u7E2E\u5C0F\u3055\u308C\u3066\u304B\u3089\u4FDD\u5B58\u3055\u308C\u307E\u3059\u3002", monitorSyncEnabled ? "Firebaseに保存され、他端末とも共有されます。" : "この端末（ブラウザ）内にのみ保存されます。", "\u300C\u30C7\u30FC\u30BF\u5165\u529B\u300D\u753B\u9762\u306E\u30AB\u30EC\u30F3\u30C0\u30FC\u304B\u3089\u30D7\u30EC\u30D3\u30E5\u30FC\u3067\u304D\u307E\u3059\u3002"), /*#__PURE__*/React.createElement("div", {
     className: "form-row"
   }, /*#__PURE__*/React.createElement("label", null, "\u5BFE\u8C61\u65E5"), /*#__PURE__*/React.createElement("input", {
     type: "date",
@@ -2181,16 +2367,56 @@ function MonitorImportModal({
     onDrop: e => {
       e.preventDefault();
       setDragOver(false);
-      acceptFile(e.dataTransfer.files && e.dataTransfer.files[0]);
+      acceptFiles(e.dataTransfer.files);
     }
-  }, selectedFile ? /*#__PURE__*/React.createElement("div", null, "\u9078\u629E\u4E2D\u306E\u30D5\u30A1\u30A4\u30EB: ", /*#__PURE__*/React.createElement("b", null, selectedFile.name)) : /*#__PURE__*/React.createElement("div", null, "\u3053\u3053\u306B\u30D5\u30A1\u30A4\u30EB\u3092\u30C9\u30E9\u30C3\u30B0\uFF06\u30C9\u30ED\u30C3\u30D7", /*#__PURE__*/React.createElement("br", null), "\u307E\u305F\u306F \u30AF\u30EA\u30C3\u30AF\u3057\u3066\u30D5\u30A1\u30A4\u30EB\u3092\u9078\u629E\uFF08PDF\u30FBJPEG\u30FBPNG\uFF09"), /*#__PURE__*/React.createElement("input", {
+  }, /*#__PURE__*/React.createElement("div", null, "\u3053\u3053\u306B\u30D5\u30A1\u30A4\u30EB\u3092\u30C9\u30E9\u30C3\u30B0\uFF06\u30C9\u30ED\u30C3\u30D7\uFF08\u8907\u6570\u53EF\uFF09", /*#__PURE__*/React.createElement("br", null), "\u307E\u305F\u306F \u30AF\u30EA\u30C3\u30AF\u3057\u3066\u30D5\u30A1\u30A4\u30EB\u3092\u9078\u629E\uFF08PDF\u30FBJPEG\u30FBPNG\uFF09"), /*#__PURE__*/React.createElement("input", {
     type: "file",
     ref: fileRef,
     accept: MONITOR_FILE_ACCEPT,
+    multiple: true,
     style: {
       display: "none"
     },
-    onChange: e => acceptFile(e.target.files[0])
+    onChange: e => {
+      acceptFiles(e.target.files);
+      e.target.value = "";
+    }
+  })), selectedFiles.length > 0 && /*#__PURE__*/React.createElement("ul", {
+    className: "monitor-selected-list"
+  }, selectedFiles.map(f => /*#__PURE__*/React.createElement("li", {
+    key: f.tempId
+  }, /*#__PURE__*/React.createElement("span", null, f.file.name), f.status === "compressing" && /*#__PURE__*/React.createElement("span", {
+    className: "monitor-selected-status"
+  }, " \u5727\u7E2E\u4E2D\u2026"), f.status === "ready" && /*#__PURE__*/React.createElement("span", {
+    className: "monitor-selected-status"
+  }, "\uFF08", Math.round(f.file.size / 1024), "KB\uFF09"), f.status === "error" && /*#__PURE__*/React.createElement("span", {
+    className: "monitor-selected-status error"
+  }, " \u26A0 ", f.errorMsg), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: () => removeSelected(f.tempId)
+  }, "\xD7")))), /*#__PURE__*/React.createElement("div", {
+    className: "modal-actions",
+    style: {
+      justifyContent: "flex-start"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: e => {
+      e.stopPropagation();
+      cameraRef.current && cameraRef.current.click();
+    }
+  }, "\uD83D\uDCF7 \u30AB\u30E1\u30E9\u3067\u64AE\u5F71"), /*#__PURE__*/React.createElement("input", {
+    type: "file",
+    ref: cameraRef,
+    accept: "image/*",
+    capture: "environment",
+    style: {
+      display: "none"
+    },
+    onChange: e => {
+      acceptFiles(e.target.files);
+      e.target.value = "";
+    }
   })), /*#__PURE__*/React.createElement("div", {
     className: "modal-actions",
     style: {
@@ -2198,8 +2424,9 @@ function MonitorImportModal({
     }
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn btn-primary",
-    onClick: handleUpload
-  }, "\u4FDD\u5B58")), status && /*#__PURE__*/React.createElement("div", {
+    onClick: handleUpload,
+    disabled: uploading
+  }, uploading ? "保存中…" : `保存${readyFiles.length > 0 ? `（${readyFiles.length}枚）` : ""}`)), status && /*#__PURE__*/React.createElement("div", {
     className: "modal-status"
   }, status), /*#__PURE__*/React.createElement("div", {
     className: "modal-actions"
@@ -2225,7 +2452,7 @@ function MonitorFilesListModal({
   }, "\u307E\u3060\u53D6\u308A\u8FBC\u307E\u308C\u305F\u753B\u9762\u304C\u3042\u308A\u307E\u305B\u3093\u3002") : /*#__PURE__*/React.createElement("div", {
     className: "notes-list"
   }, files.map(f => /*#__PURE__*/React.createElement("div", {
-    key: f.date,
+    key: f.date + "_" + f.fileId,
     className: "notes-list-item monitor-list-item"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "notes-list-date"
@@ -2238,7 +2465,7 @@ function MonitorFilesListModal({
     onClick: () => onPreview(f.date)
   }, "\u30D7\u30EC\u30D3\u30E5\u30FC"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-small btn-ghost-red",
-    onClick: () => onDelete(f.date)
+    onClick: () => onDelete(f.date, f.fileId)
   }, "\u524A\u9664"))))), /*#__PURE__*/React.createElement("div", {
     className: "modal-actions"
   }, /*#__PURE__*/React.createElement("button", {
@@ -2246,36 +2473,118 @@ function MonitorFilesListModal({
     onClick: onClose
   }, "\u9589\u3058\u308B"))));
 }
+
+// 1日に複数の中央監視画面が登録されている場合、まとめてプレビューし、画面ごとの個別分析と
+// 全画面を踏まえた総括の両方をGeminiに依頼できるようにしている。
 function MonitorPreviewModal({
   date,
-  fileMeta,
+  files,
   onClose,
   onDelete
 }) {
-  const [url, setUrl] = useState(null);
-  const [status, setStatus] = useState("読み込み中…");
+  const [previews, setPreviews] = useState({}); // fileId -> { url, status }
+  const [fileComments, setFileComments] = useState({}); // fileId -> { status, comment }
+  const [summaryStatus, setSummaryStatus] = useState("idle"); // idle | loading | done | error
+  const [summaryComment, setSummaryComment] = useState("");
   useEffect(() => {
     let cancelled = false;
-    let revokeUrl = null;
-    setUrl(null);
-    setStatus("読み込み中…");
-    monitorGetPreviewSrc(date).then(result => {
-      if (cancelled) return;
-      if (!result) {
-        setStatus("見つかりませんでした。");
-        return;
-      }
-      setUrl(result.url);
-      if (result.revoke) revokeUrl = result.url;
-      setStatus("");
-    }).catch(e => {
-      if (!cancelled) setStatus("読み込みエラー: " + e.message);
+    const revokeUrls = [];
+    setPreviews({});
+    setFileComments({});
+    setSummaryStatus("idle");
+    setSummaryComment("");
+    files.forEach(f => {
+      setPreviews(prev => ({
+        ...prev,
+        [f.fileId]: {
+          url: null,
+          status: "読み込み中…"
+        }
+      }));
+      monitorGetPreviewSrc(date, f.fileId).then(result => {
+        if (cancelled) return;
+        if (!result) {
+          setPreviews(prev => ({
+            ...prev,
+            [f.fileId]: {
+              url: null,
+              status: "見つかりませんでした。"
+            }
+          }));
+          return;
+        }
+        if (result.revoke) revokeUrls.push(result.url);
+        setPreviews(prev => ({
+          ...prev,
+          [f.fileId]: {
+            url: result.url,
+            status: ""
+          }
+        }));
+      }).catch(e => {
+        if (!cancelled) setPreviews(prev => ({
+          ...prev,
+          [f.fileId]: {
+            url: null,
+            status: "読み込みエラー: " + e.message
+          }
+        }));
+      });
     });
     return () => {
       cancelled = true;
-      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+      revokeUrls.forEach(u => URL.revokeObjectURL(u));
     };
-  }, [date]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, files.map(f => f.fileId).join(",")]);
+  const analyzeOneFile = async f => {
+    setFileComments(prev => ({
+      ...prev,
+      [f.fileId]: {
+        status: "loading",
+        comment: ""
+      }
+    }));
+    try {
+      const dataUrl = await monitorGetFileDataUrl(date, f.fileId);
+      if (!dataUrl) throw new Error("画像データが見つかりませんでした。");
+      const text = await fetchGeminiImageComment(buildMonitorImagePrompt(date, f.fileName), dataUrl, f.fileType);
+      setFileComments(prev => ({
+        ...prev,
+        [f.fileId]: {
+          status: "done",
+          comment: text
+        }
+      }));
+      return text;
+    } catch (e) {
+      setFileComments(prev => ({
+        ...prev,
+        [f.fileId]: {
+          status: "error",
+          comment: e.message
+        }
+      }));
+      throw e;
+    }
+  };
+  const handleSummarize = async () => {
+    setSummaryStatus("loading");
+    try {
+      const perFileTexts = [];
+      for (const f of files) {
+        const existing = fileComments[f.fileId];
+        const comment = existing && existing.status === "done" ? existing.comment : await analyzeOneFile(f);
+        perFileTexts.push(`【${f.fileName}】${comment}`);
+      }
+      const summary = await fetchGeminiComment(buildMonitorSummaryPrompt(date, perFileTexts));
+      setSummaryComment(summary);
+      setSummaryStatus("done");
+    } catch (e) {
+      setSummaryComment(e.message);
+      setSummaryStatus("error");
+    }
+  };
   return /*#__PURE__*/React.createElement("div", {
     className: "modal-backdrop",
     onClick: onClose
@@ -2286,36 +2595,61 @@ function MonitorPreviewModal({
     className: "fullscreen-modal-header"
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-title"
-  }, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\uFF1A", date, fileMeta ? `（${fileMeta.fileName}）` : ""), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8
-    }
-  }, url && fileMeta && /*#__PURE__*/React.createElement("a", {
-    className: "btn",
-    href: url,
-    download: fileMeta.fileName,
-    target: "_blank",
-    rel: "noreferrer"
-  }, "\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9"), fileMeta && /*#__PURE__*/React.createElement("button", {
-    className: "btn btn-ghost-red",
-    onClick: () => onDelete(date)
-  }, "\u524A\u9664"), /*#__PURE__*/React.createElement("button", {
+  }, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\uFF1A", date, files.length > 0 && `（${files.length}枚）`), /*#__PURE__*/React.createElement("button", {
     className: "btn",
     onClick: onClose
-  }, "\u9589\u3058\u308B \u2715"))), /*#__PURE__*/React.createElement("div", {
-    className: "monitor-preview-body"
-  }, status && /*#__PURE__*/React.createElement("div", {
-    className: "analysis-empty"
-  }, status), url && fileMeta && fileMeta.fileType === "application/pdf" && /*#__PURE__*/React.createElement("iframe", {
-    src: url,
-    className: "monitor-preview-frame",
-    title: `${date}の中央監視画面`
-  }), url && fileMeta && fileMeta.fileType !== "application/pdf" && /*#__PURE__*/React.createElement("img", {
-    src: url,
-    className: "monitor-preview-image",
-    alt: `${date}の中央監視画面`
-  }))));
+  }, "\u9589\u3058\u308B \u2715")), files.length > 1 && /*#__PURE__*/React.createElement("div", {
+    className: "ai-gemini-box monitor-ai-box monitor-summary-box"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small btn-primary",
+    onClick: handleSummarize,
+    disabled: summaryStatus === "loading"
+  }, summaryStatus === "loading" ? "🤖 総括中…" : "🤖 Geminiで総括（全画面まとめて分析）"), summaryComment && /*#__PURE__*/React.createElement("p", {
+    className: "analysis-note ai-comment" + (summaryStatus === "error" ? " ai-comment-error" : "")
+  }, summaryStatus === "error" ? "⚠ " : "📋 ", summaryComment)), files.map(f => {
+    const preview = previews[f.fileId] || {};
+    const aiState = fileComments[f.fileId] || {
+      status: "idle",
+      comment: ""
+    };
+    return /*#__PURE__*/React.createElement("div", {
+      key: f.fileId,
+      className: "monitor-file-card"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "monitor-file-card-header"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "panel-title"
+    }, f.fileName), preview.url && /*#__PURE__*/React.createElement("a", {
+      className: "btn btn-small",
+      href: preview.url,
+      download: f.fileName,
+      target: "_blank",
+      rel: "noreferrer"
+    }, "\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9"), /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-small btn-ghost-red",
+      onClick: () => onDelete(date, f.fileId)
+    }, "\u524A\u9664")), /*#__PURE__*/React.createElement("div", {
+      className: "monitor-preview-body"
+    }, preview.status && /*#__PURE__*/React.createElement("div", {
+      className: "analysis-empty"
+    }, preview.status), preview.url && f.fileType === "application/pdf" && /*#__PURE__*/React.createElement("iframe", {
+      src: preview.url,
+      className: "monitor-preview-frame",
+      title: f.fileName
+    }), preview.url && f.fileType !== "application/pdf" && /*#__PURE__*/React.createElement("img", {
+      src: preview.url,
+      className: "monitor-preview-image",
+      alt: f.fileName
+    })), preview.url && /*#__PURE__*/React.createElement("div", {
+      className: "ai-gemini-box monitor-ai-box"
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "btn btn-small",
+      onClick: () => analyzeOneFile(f),
+      disabled: aiState.status === "loading"
+    }, aiState.status === "loading" ? "🤖 画像分析中…" : "🤖 Geminiで画像分析"), aiState.comment && /*#__PURE__*/React.createElement("p", {
+      className: "analysis-note ai-comment" + (aiState.status === "error" ? " ai-comment-error" : "")
+    }, aiState.status === "error" ? "⚠ " : "🤖 ", aiState.comment)));
+  })));
 }
 
 // ============================================================
@@ -2335,20 +2669,36 @@ function GranularityToggle({
   }, l)));
 }
 function AiCommentBox({
-  buildPrompt
+  buildPrompt,
+  onAddChart
 }) {
   const [status, setStatus] = useState("idle"); // idle | loading | done | error
   const [comment, setComment] = useState("");
+  const [suggestedKeys, setSuggestedKeys] = useState(null);
+  const [chartAdded, setChartAdded] = useState(false);
   const handleClick = async () => {
     setStatus("loading");
+    setSuggestedKeys(null);
+    setChartAdded(false);
     try {
-      const text = await fetchGeminiComment(buildPrompt());
-      setComment(text);
+      const rawText = await fetchGeminiComment(buildPrompt());
+      if (onAddChart) {
+        const parsed = parseChartSuggestion(rawText);
+        setComment(parsed.comment);
+        setSuggestedKeys(parsed.suggestedKeys);
+      } else {
+        setComment(rawText);
+      }
       setStatus("done");
     } catch (e) {
       setComment(e.message);
       setStatus("error");
     }
+  };
+  const handleAddChart = () => {
+    const chartName = `Gemini提案: ${suggestedKeys.map(k => METRICS[k].label).join(" × ")}`;
+    onAddChart(suggestedKeys, chartName);
+    setChartAdded(true);
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "ai-gemini-box"
@@ -2358,7 +2708,14 @@ function AiCommentBox({
     disabled: status === "loading"
   }, status === "loading" ? "🤖 分析中…" : "🤖 Geminiで分析"), comment && /*#__PURE__*/React.createElement("p", {
     className: "analysis-note ai-comment" + (status === "error" ? " ai-comment-error" : "")
-  }, status === "error" ? "⚠ " : "🤖 ", comment));
+  }, status === "error" ? "⚠ " : "🤖 ", comment), suggestedKeys && !chartAdded && /*#__PURE__*/React.createElement("div", {
+    className: "ai-chart-suggestion"
+  }, "\uD83D\uDCCA \u304A\u3059\u3059\u3081\u30B0\u30E9\u30D5\u306E\u7D44\u307F\u5408\u308F\u305B: ", suggestedKeys.map(k => METRICS[k].label).join(" × "), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: handleAddChart
+  }, "\uFF0B \u3053\u306E\u30B0\u30E9\u30D5\u3092\u8FFD\u52A0")), chartAdded && /*#__PURE__*/React.createElement("p", {
+    className: "ai-chart-added-note"
+  }, "\u2705 \u4E0B\u306B\u30B0\u30E9\u30D5\u3092\u8FFD\u52A0\u3057\u307E\u3057\u305F"));
 }
 function AnalysisView({
   data,
@@ -3640,16 +3997,35 @@ function App() {
   const [monitorTick, setMonitorTick] = useState(0);
 
   // 中央監視画面の一覧：Firebase同期が有効ならリアルタイム購読、そうでなければ
-  // IndexedDBから読み込む（monitorTickが変わるたびに再読み込み）。
+  // IndexedDBから読み込む（monitorTickが変わるたびに再読み込み）。1日に複数ファイルを
+  // 持てるよう monitorFilesMeta/{date}/{fileId} というネスト構造を前提に平坦なリストへ
+  // 変換する。旧形式（1日1ファイル、{date}直下にfileName等が入る）のデータが残っていても
+  // 読み取れるよう、フォールバックも入れている。
   useEffect(() => {
     if (monitorSyncEnabled) {
       const ref = db.ref("monitorFilesMeta");
       const handler = snap => {
         const obj = snap.val() || {};
-        const list = Object.entries(obj).map(([dateKey, meta]) => ({
-          date: dateKey,
-          ...meta
-        })).sort((a, b) => a.date < b.date ? 1 : -1);
+        const list = [];
+        Object.entries(obj).forEach(([dateKey, val]) => {
+          if (val && val.fileName) {
+            // 旧形式（複数ファイル対応前に保存されたデータ）との互換
+            list.push({
+              date: dateKey,
+              fileId: "legacy",
+              ...val
+            });
+          } else {
+            Object.entries(val || {}).forEach(([fileId, meta]) => {
+              list.push({
+                date: dateKey,
+                fileId,
+                ...meta
+              });
+            });
+          }
+        });
+        list.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.uploadedAt || 0) - (b.uploadedAt || 0));
         setMonitorFiles(list);
       };
       ref.on("value", handler);
@@ -3660,8 +4036,8 @@ function App() {
   const handleUploadedMonitorFile = () => {
     if (!monitorSyncEnabled) setMonitorTick(t => t + 1);
   };
-  const handleDeleteMonitorFile = dateStr => {
-    monitorDeleteFile(dateStr).then(() => {
+  const handleDeleteMonitorFile = (dateStr, fileId) => {
+    monitorDeleteFile(dateStr, fileId).then(() => {
       if (!monitorSyncEnabled) setMonitorTick(t => t + 1);
     });
   };
@@ -3987,6 +4363,21 @@ function App() {
     }]);
     setNextChartId(id + 1);
     setOpenChartSettings(id);
+  };
+  const addChartWithMetrics = (keys, name) => {
+    const id = nextChartId;
+    const valid = keys.filter(k => METRICS[k]);
+    setCharts(prev => [...prev, {
+      id,
+      name: name || `グラフ${id}`,
+      chartType: "line",
+      selectedMetrics: valid.length ? valid : [Object.keys(METRICS)[0]],
+      compareEnabled: true,
+      showForecast: true,
+      forecastMethod: "seasonal",
+      dayTypeColoring: false
+    }]);
+    setNextChartId(id + 1);
   };
   const removeChart = id => {
     setCharts(prev => prev.filter(c => c.id !== id));
@@ -4500,7 +4891,8 @@ function App() {
     })), charts[0] && /*#__PURE__*/React.createElement("div", {
       className: "combined-chart-wrap"
     }, renderChartBody(charts[0], true)), /*#__PURE__*/React.createElement(AiCommentBox, {
-      buildPrompt: () => buildAnalysisPrompt(`${kpiLabel}の${view === "day" ? "月次" : "年間"}実績分析`, kpiList.map(k => `${k.label}: ${fmtNum(k.current, 1)}${k.unit}` + (k.pct != null ? `（前期比${k.pct >= 0 ? "+" : ""}${fmtNum(k.pct, 1)}%）` : "")).concat([`総合熱源効率: ${fmtNum(efficiency.ratio, 1)}%`, `CO2排出量: ${fmtNum(efficiency.co2, 1)}t-CO2`, `概算コスト: ${fmtNum(efficiency.costYen, 0)}円`]).concat(peak ? [`日平均電力ピーク: ${fmtNum(peak.demandKW, 1)}kW（${peak.date}／契約比${fmtNum(peak.demandKW / settings.contractKW * 100, 0)}%）`] : []).join(" / "))
+      buildPrompt: () => buildAnalysisPrompt(`${kpiLabel}の${view === "day" ? "月次" : "年間"}実績分析`, kpiList.map(k => `${k.label}: ${fmtNum(k.current, 1)}${k.unit}` + (k.pct != null ? `（前期比${k.pct >= 0 ? "+" : ""}${fmtNum(k.pct, 1)}%）` : "")).concat([`総合熱源効率: ${fmtNum(efficiency.ratio, 1)}%`, `CO2排出量: ${fmtNum(efficiency.co2, 1)}t-CO2`, `概算コスト: ${fmtNum(efficiency.costYen, 0)}円`]).concat(peak ? [`日平均電力ピーク: ${fmtNum(peak.demandKW, 1)}kW（${peak.date}／契約比${fmtNum(peak.demandKW / settings.contractKW * 100, 0)}%）`] : []).join(" / "), buildChartSuggestionInstruction()),
+      onAddChart: addChartWithMetrics
     })), charts.slice(1).map(chart => /*#__PURE__*/React.createElement("section", {
       className: "chart-panel chart-main",
       key: chart.id
@@ -4657,7 +5049,10 @@ function App() {
         .analysis-note { font-size:12px; color:#64748b; margin:0 0 12px; }
         .analysis-note.ai-comment { margin:12px 0 0; padding:10px 12px; background:#f8fafc; border-radius:8px; color:#334155; line-height:1.6; }
         .ai-gemini-box { margin-top:8px; }
+        .monitor-ai-box { margin-top:14px; flex-shrink:0; }
         .analysis-note.ai-comment-error { background:#fef2f2; color:#b91c1c; }
+        .ai-chart-suggestion { margin-top:6px; padding:8px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; font-size:13px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+        .ai-chart-added-note { margin-top:6px; font-size:13px; color:#16a34a; }
         .analysis-empty { padding:24px; text-align:center; color:#94a3b8; font-size:13px; }
         .granularity-toggle { display:flex; gap:4px; }
         .granularity-toggle .btn.active { background:#2563eb; border-color:#2563eb; color:#fff; }
@@ -4710,6 +5105,16 @@ function App() {
         .monitor-preview-body { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; overflow:auto; background:#f1f5f9; border-radius:8px; margin-top:14px; }
         .monitor-preview-frame { width:100%; height:min(75vh, 900px); border:none; border-radius:8px; }
         .monitor-preview-image { max-width:100%; max-height:75vh; object-fit:contain; }
+        .monitor-selected-list { list-style:none; margin:6px 0 0; padding:0; font-size:13px; }
+        .monitor-selected-list li { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #f1f5f9; }
+        .monitor-selected-status { color:#64748b; font-size:12px; }
+        .monitor-selected-status.error { color:#b91c1c; }
+        .monitor-file-card { border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-top:14px; }
+        .monitor-file-card-header { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:4px; }
+        .monitor-summary-box { padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; margin-bottom:4px; }
+        .app-shell[data-theme="dark"] .monitor-file-card { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-summary-box { background:#1e293b; border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-selected-list li { border-color:#334155; }
         .monitor-dropzone {
           border:2px dashed #cbd5e1; border-radius:10px; padding:24px 16px; text-align:center;
           font-size:13px; color:#64748b; cursor:pointer; margin:10px 0; transition:background 0.15s, border-color 0.15s;
@@ -4780,6 +5185,8 @@ function App() {
         .app-shell[data-theme="dark"] .kpi-period-label { color:#f1f5f9; }
         .app-shell[data-theme="dark"] .analysis-note.ai-comment { background:#1e293b; color:#cbd5e1; }
         .app-shell[data-theme="dark"] .analysis-note.ai-comment-error { background:#3f1d1d; color:#fecaca; }
+        .app-shell[data-theme="dark"] .ai-chart-suggestion { background:#1e293b; border-color:#334155; color:#e2e8f0; }
+        .app-shell[data-theme="dark"] .ai-chart-added-note { color:#4ade80; }
         .app-shell[data-theme="dark"] .kpi-value, .app-shell[data-theme="dark"] .entry-form-label,
         .app-shell[data-theme="dark"] .entry-cal-title { color:#f1f5f9; }
         .app-shell[data-theme="dark"] input, .app-shell[data-theme="dark"] select, .app-shell[data-theme="dark"] textarea {

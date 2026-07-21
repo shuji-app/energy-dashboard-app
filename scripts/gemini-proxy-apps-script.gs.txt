@@ -44,8 +44,14 @@ function doPost(e) {
     var model = "gemini-flash-latest";
     var url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
 
+    // 中央監視画面の画像/PDF分析（app.jsxのfetchGeminiImageComment）からは
+    // imageBase64・imageMimeTypeも送られてくるので、指定があればinlineDataパーツとして追加する。
+    var parts = [{ text: prompt }];
+    if (body.imageBase64) {
+      parts.push({ inlineData: { mimeType: body.imageMimeType || "image/jpeg", data: body.imageBase64 } });
+    }
     var payload = {
-      contents: [{ parts: [{ text: prompt }] }],
+      contents: [{ parts: parts }],
     };
     var options = {
       method: "post",
