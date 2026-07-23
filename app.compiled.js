@@ -111,6 +111,14 @@ const METRICS = {
     kind: "avg",
     group: "気象"
   },
+  enthalpyKJkg: {
+    label: "比エンタルピー(外気)",
+    unit: "kJ/kg",
+    color: "#0ea5e9",
+    kind: "avg",
+    group: "気象",
+    derived: true
+  },
   efficiencyPct: {
     label: "総合熱源効率",
     unit: "%",
@@ -142,10 +150,20 @@ const METRICS = {
     kind: "sum",
     group: "コスト・環境",
     derived: true
+  },
+  equipUtilPct: {
+    label: "設備稼働率(負荷/定格能力)",
+    unit: "%",
+    color: "#65a30d",
+    kind: "avg",
+    group: "コスト・環境",
+    derived: true
   }
 };
 const METRIC_GROUPS = ["電力", "重油", "熱負荷", "気象", "コスト・環境"];
 const FORECASTABLE = ["elecKWh", "oilTotalL", "oilChillerTotalL", "oilBoilerTotalL", "coolLoadGJ", "heatLoadGJ", "totalLoadGJ", "co2T", "crudeOilKL", "costYen"];
+// ダッシュボードのKPIカードと同じ項目（分析ビューの日付比較で比較対象にする）
+const DASHBOARD_KPI_KEYS = ["elecKWh", "oilTotalL", "coolLoadGJ", "heatLoadGJ", "demandKW", "efficiencyPct", "co2T", "crudeOilKL", "costYen", "enthalpyKJkg", "equipUtilPct"];
 const CHART_TYPE_OPTIONS = [["line", "折れ線"], ["bar", "棒"], ["stackedBar", "積み上げ棒"], ["scatter", "散布図(気温相関)"]];
 const FM_LABELS = ["4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月", "1月", "2月", "3月"];
 const DAY_TYPE_LABEL = {
@@ -172,7 +190,13 @@ const DEFAULT_SETTINGS = {
   anomalySigmaThreshold: 2,
   demandAlertPct: 100,
   elecPricePerKWh: 30,
-  oilPricePerL: 100
+  oilPricePerL: 100,
+  // 熱源機器の定格能力(kW)。現時点では架空の仮数値。竣工図・機器リストの実際の値に
+  // 置き換えること（設定画面「熱源機器の定格能力」から編集可能）。
+  chiller1CapacityKW: 500,
+  chiller2CapacityKW: 500,
+  boiler1CapacityKW: 300,
+  boiler2CapacityKW: 300
 };
 const LS_DATA_KEY = "energyApp.data.v1";
 const LS_SETTINGS_KEY = "energyApp.settings.v1";
@@ -285,13 +309,94 @@ async function fetchGeminiImageComment(prompt, dataUrl, mimeType) {
   return data.comment || "(コメントを取得できませんでした)";
 }
 
+// 複数枚の画像/PDFを1回のGemini呼び出しでまとめて渡す（カメラで複数の監視画面を撮影し、
+// 画面をまたいだ機器をまとめて分析したい場合など）。images = [{ dataUrl, mimeType }, ...]。
+// Apps Script側（doPost）がbody.imagesの配列を読み取れるよう対応している必要がある。
+async function fetchGeminiMultiImageComment(prompt, images) {
+  if (!GEMINI_PROXY_URL || GEMINI_PROXY_URL === "YOUR_APPS_SCRIPT_WEB_APP_URL") {
+    throw new Error("Apps ScriptのURLが未設定です（app.jsx内のGEMINI_PROXY_URLを設定してください）。");
+  }
+  const imagesPayload = images.map(({
+    dataUrl,
+    mimeType
+  }) => ({
+    data: dataUrl.slice(dataUrl.indexOf(",") + 1),
+    mimeType: mimeType || "image/jpeg"
+  }));
+  const res = await fetch(GEMINI_PROXY_URL, {
+    method: "POST",
+    body: JSON.stringify({
+      prompt,
+      images: imagesPayload
+    })
+  });
+  if (!res.ok) throw new Error(`通信エラー（${res.status}）`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.comment || "(コメントを取得できませんでした)";
+}
+
 // 中央監視画面1枚を単体で分析させるプロンプト。
 function buildMonitorImagePrompt(dateStr, fileName) {
   return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}の中央監視装置の画面（${fileName}）です。表示されている数値・稼働状態・警報表示などを読み取り、注意すべき点や異常の兆候があれば日本語で150字程度で指摘してください。画像/文書から内容が読み取れない場合はその旨を述べてください。`;
 }
+// 機器ごとの読み取り結果をアプリ側で表として描画できるよう、回答の最後の1行にだけ
+// 機械可読なJSON配列を出力させる共通の指示文（parseLoadTableで抜き出す）。
+const LOAD_TABLE_OUTPUT_INSTRUCTION = `アドバイス本文には太字記号(**)や見出し記号(#)、罫線(---)などの装飾は使わず、プレーンな` + `日本語の文章だけにしてください。そのうえで、回答の最後の行にだけ、各機器の読み取り結果を` + `次のJSON形式で出力してください（説明文を混ぜないこと）：\n` + `LOAD_TABLE: [{"name":"機器名","outputKW":数値またはnull,"capacityKW":数値,"loadPct":数値またはnull}, ...]`;
+
+// Geminiの回答から末尾のLOAD_TABLE:行を取り出し、本文コメント（装飾記号は念のため除去）と
+// 機器ごとの表データに分離する。
+function parseLoadTable(rawText) {
+  const m = rawText.match(/LOAD_TABLE:\s*(\[[\s\S]*?\])\s*$/i);
+  if (!m) return {
+    comment: stripMarkdownDecoration(rawText),
+    table: null
+  };
+  let table = null;
+  try {
+    table = JSON.parse(m[1]);
+  } catch (e) {
+    table = null;
+  }
+  return {
+    comment: stripMarkdownDecoration(rawText.slice(0, m.index).trim()),
+    table
+  };
+}
+function stripMarkdownDecoration(text) {
+  return text.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^#{1,6}\s*/gm, "").replace(/^-{3,}\s*$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// 中央監視画面に表示された各機器の「瞬間出力」を読み取り、定格能力（設定画面で入力済み）と
+// 突き合わせて、今この瞬間の運転をより効率的にする組み合わせ・負荷配分のアドバイスを求める。
+function buildOptimalOperationPrompt(dateStr, fileName, settings) {
+  const capacityLines = [`冷温水発生器No.1: 定格 ${settings.chiller1CapacityKW || 0} kW`, `冷温水発生器No.2: 定格 ${settings.chiller2CapacityKW || 0} kW`, `ボイラーNo.1: 定格 ${settings.boiler1CapacityKW || 0} kW`, `ボイラーNo.2: 定格 ${settings.boiler2CapacityKW || 0} kW`].join("\n");
+  return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}に撮影した中央監視装置の画面（${fileName}）で、各熱源機器の現在の瞬間出力（kW等）が表示されています。\n\n` + `各機器の定格能力は次の通りです：\n${capacityLines}\n\n` + `画面から各機器の現在の出力を読み取り、定格能力に対する負荷率(%)を機器ごとに算出してください。` + `熱源機器は一般に、定格に対して極端に低い負荷（部分負荷）で運転すると効率が下がる傾向があります。` + `現在の稼働状況（どの機器が動いていて、どのくらいの負荷率か）を踏まえ、機器の組み合わせや負荷配分を` + `見直すことでより効率的な運転にできないか、日本語で300字程度のアドバイスを述べてください。` + `画面から数値が読み取れない場合は、その旨と読み取れた範囲の情報を述べてください。\n\n` + LOAD_TABLE_OUTPUT_INSTRUCTION;
+}
+// buildOptimalOperationPromptの複数画像版。監視画面が1枚に収まらず複数枚に分けて撮影した
+// 場合など、全画像をまとめて1回のGemini呼び出しで見比べながらアドバイスさせたいときに使う。
+function buildOptimalOperationMultiPrompt(dateStr, fileNames, settings) {
+  const capacityLines = [`冷温水発生器No.1: 定格 ${settings.chiller1CapacityKW || 0} kW`, `冷温水発生器No.2: 定格 ${settings.chiller2CapacityKW || 0} kW`, `ボイラーNo.1: 定格 ${settings.boiler1CapacityKW || 0} kW`, `ボイラーNo.2: 定格 ${settings.boiler2CapacityKW || 0} kW`].join("\n");
+  return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}に撮影した中央監視装置の画面${fileNames.length}枚（${fileNames.join("、")}）です。監視画面が1台では収まらず複数枚に分けて撮影されている場合があり、各熱源機器の現在の瞬間出力（kW等）がいずれかの画像に表示されています。\n\n` + `各機器の定格能力は次の通りです：\n${capacityLines}\n\n` + `すべての画像を確認し、各機器の現在の出力を読み取って、定格能力に対する負荷率(%)を機器ごとに算出してください。` + `熱源機器は一般に、定格に対して極端に低い負荷（部分負荷）で運転すると効率が下がる傾向があります。` + `画像全体を通して見た現在の稼働状況（どの機器が動いていて、どのくらいの負荷率か）を踏まえ、機器の組み合わせや` + `負荷配分を見直すことでより効率的な運転にできないか、日本語で300字程度のアドバイスを述べてください。` + `一部の画像から数値が読み取れない場合は、その旨と読み取れた範囲の情報を述べてください。\n\n` + LOAD_TABLE_OUTPUT_INSTRUCTION;
+}
 // 複数画面それぞれの個別分析結果を踏まえて、その日全体としての総括をさせるプロンプト（テキストのみ）。
 function buildMonitorSummaryPrompt(dateStr, perFileComments) {
   return `あなたは工場設備のエネルギー管理の専門家です。以下は${dateStr}に取り込まれた中央監視装置の複数の画面について、それぞれ個別に分析した結果です。\n\n${perFileComments.join("\n")}\n\nこれらを踏まえて、その日の設備全体としての状態を200字程度の日本語でまとめてください。画面間で関連する異常や矛盾があれば特に指摘してください。`;
+}
+
+// 竣工図・機器リストのPDF/画像から、熱源機器4台の定格能力(kW)を読み取らせるプロンプト。
+// 回答の最後の1行だけに機械可読なJSON形式で出力させ、parseExtractedCapacityで抜き出す。
+function buildEquipCapacityExtractionPrompt() {
+  return `あなたは設備台帳の読み取りアシスタントです。添付は熱源機器の竣工図または機器リストです。` + `次の4つの機器について、記載されている定格能力(kW)を読み取ってください。` + `冷凍能力がUSRt(米国冷凍トン、1USRt≈3.517kW)やkcal/h(1kcal/h≈1.163W)などkW以外の単位で` + `書かれている場合はkWに換算してください。読み取れない機器はnullにしてください。\n` + `1. 冷温水発生器No.1\n2. 冷温水発生器No.2\n3. ボイラーNo.1\n4. ボイラーNo.2\n\n` + `回答は他の説明文を含めず、最後の行にだけ次のJSON形式で出力してください：\n` + `EXTRACTED_CAPACITY: {"chiller1": 数値またはnull, "chiller2": 数値またはnull, "boiler1": 数値またはnull, "boiler2": 数値またはnull}`;
+}
+function parseExtractedCapacity(rawText) {
+  const m = rawText.match(/EXTRACTED_CAPACITY:\s*(\{[\s\S]*?\})/i);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]);
+  } catch (e) {
+    return null;
+  }
 }
 function buildAnalysisPrompt(title, dataText, extraInstruction) {
   return `あなたは工場設備のエネルギー管理の専門家です。次のデータについて、200字程度の日本語で実務的な分析コメントを1つだけ書いてください。数値の解説だけでなく、可能なら改善のヒントも添えてください。前置きや見出しは不要で、コメント本文だけを返してください。\n\n【${title}】\n${dataText}${extraInstruction ? "\n\n" + extraInstruction : ""}`;
@@ -379,13 +484,25 @@ function fbReplaceAll(rows, settingsObj, notesObj) {
 // ============================================================
 // ユーティリティ
 // ============================================================
+// 外気温度・湿度から比エンタルピー（乾き空気1kgあたりの熱量, kJ/kg(DA)）を計算する。
+// 飽和水蒸気圧はTetens近似式、大気圧は標準大気圧(1013.25hPa)を前提とする。
+function calcSpecificEnthalpy(tempC, rhPct) {
+  if (tempC == null || rhPct == null || isNaN(tempC) || isNaN(rhPct)) return null;
+  const satPressureHpa = 6.1078 * Math.pow(10, 7.5 * tempC / (tempC + 237.3));
+  const vaporPressureHpa = rhPct / 100 * satPressureHpa;
+  const atmPressureHpa = 1013.25;
+  const humidityRatio = 0.622 * vaporPressureHpa / (atmPressureHpa - vaporPressureHpa);
+  return 1.006 * tempC + humidityRatio * (2501 + 1.805 * tempC);
+}
 function withDerived(row) {
   const totalLoadGJ = (row.coolLoadGJ || 0) + (row.heatLoadGJ || 0);
   const demandKW = (row.elecKWh || 0) / 24;
+  const enthalpyKJkg = calcSpecificEnthalpy(row.tempAvg, row.humidityAvg);
   return {
     ...row,
     totalLoadGJ,
-    demandKW
+    demandKW,
+    enthalpyKJkg
   };
 }
 
@@ -398,12 +515,18 @@ function withComputed(row, settings) {
   const crudeOilKL = settings.crudeOilGJperKL > 0 ? inputGJ / settings.crudeOilGJperKL : null;
   const costYen = (row.elecKWh || 0) * settings.elecPricePerKWh + (row.oilTotalL || 0) * settings.oilPricePerL;
   const efficiencyPct = inputGJ > 0 ? (row.totalLoadGJ || 0) / inputGJ * 100 : null;
+  // 設備稼働率＝その日の負荷熱量 ÷ 熱源機器の定格能力から算出できる1日あたりの理論上限熱量。
+  // 定格能力(kW)は現時点で竣工図・機器リストの実際の値が未入力の場合、設定画面の仮数値が使われる。
+  const totalRatedCapacityKW = (settings.chiller1CapacityKW || 0) + (settings.chiller2CapacityKW || 0) + (settings.boiler1CapacityKW || 0) + (settings.boiler2CapacityKW || 0);
+  const dailyMaxCapacityGJ = totalRatedCapacityKW * 24 * 0.0036; // kW→GJ/日 (1kWh=0.0036GJ)
+  const equipUtilPct = dailyMaxCapacityGJ > 0 ? (row.totalLoadGJ || 0) / dailyMaxCapacityGJ * 100 : null;
   return {
     ...row,
     co2T,
     crudeOilKL,
     costYen,
-    efficiencyPct
+    efficiencyPct,
+    equipUtilPct
   };
 }
 
@@ -721,6 +844,17 @@ function addDays(dateStr, delta) {
   const d = parseISO(dateStr);
   d.setDate(d.getDate() + delta);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+// 月単位で日付をずらす（前月・前年比較用）。ずらした先の月に同じ日が無い場合
+// （例：3/31の前月=2/31）は、その月の末日にクランプする。
+function addMonthsClamped(dateStr, monthsDelta) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const totalMonths = y * 12 + (m - 1) + monthsDelta;
+  const targetYear = Math.floor(totalMonths / 12);
+  const targetMonth = totalMonths % 12; // 0-based
+  const ym = `${targetYear}-${String(targetMonth + 1).padStart(2, "0")}`;
+  const targetDay = Math.min(d, daysInMonth(ym));
+  return `${ym}-${String(targetDay).padStart(2, "0")}`;
 }
 function classifyDay(dateStr, holidayMap) {
   if (holidayMap[dateStr]) return "holiday";
@@ -1419,6 +1553,54 @@ function SettingsModal({
 }) {
   const [form, setForm] = useState(settings);
   const [backupStatus, setBackupStatus] = useState("");
+  const [extractStatus, setExtractStatus] = useState("idle"); // idle | loading | done | error
+  const [extractMessage, setExtractMessage] = useState("");
+  const equipFileRef = useRef(null);
+  const handleExtractEquipFile = async file => {
+    if (!file) return;
+    if (!MONITOR_FILE_TYPES.includes(file.type)) {
+      setExtractStatus("error");
+      setExtractMessage("PDF・JPEG・PNGのみ読み込めます。");
+      return;
+    }
+    setExtractStatus("loading");
+    setExtractMessage("");
+    try {
+      const processed = await compressImageFile(file, MONITOR_IMAGE_MAX_DIM, MONITOR_IMAGE_QUALITY);
+      if (processed.size > MONITOR_FILE_MAX_BYTES) {
+        throw new Error(`ファイルサイズが大きすぎます（${MONITOR_FILE_MAX_BYTES / 1024 / 1024}MB以下にしてください）。`);
+      }
+      const dataUrl = await fileToDataUrl(processed);
+      const rawText = await fetchGeminiImageComment(buildEquipCapacityExtractionPrompt(), dataUrl, processed.type);
+      const extracted = parseExtractedCapacity(rawText);
+      if (!extracted) throw new Error("読み取り結果を解析できませんでした。お手数ですが手入力してください。");
+      const fieldMap = {
+        chiller1: "chiller1CapacityKW",
+        chiller2: "chiller2CapacityKW",
+        boiler1: "boiler1CapacityKW",
+        boiler2: "boiler2CapacityKW"
+      };
+      const updates = {};
+      let foundCount = 0;
+      Object.entries(fieldMap).forEach(([extKey, formKey]) => {
+        const v = extracted[extKey];
+        if (v != null && !isNaN(v)) {
+          updates[formKey] = Number(v);
+          foundCount += 1;
+        }
+      });
+      if (foundCount === 0) throw new Error("機器の定格能力を読み取れませんでした。お手数ですが手入力してください。");
+      setForm(prev => ({
+        ...prev,
+        ...updates
+      }));
+      setExtractStatus("done");
+      setExtractMessage(`${foundCount}件の項目を読み取りました。内容を確認し、問題なければ「保存」を押してください。`);
+    } catch (e) {
+      setExtractStatus("error");
+      setExtractMessage(e.message);
+    }
+  };
   const handleImportFile = file => {
     const reader = new FileReader();
     reader.onload = e => {
@@ -1563,6 +1745,68 @@ function SettingsModal({
   })), /*#__PURE__*/React.createElement("p", {
     className: "modal-note"
   }, "\u6982\u7B97\u30B3\u30B9\u30C8\u306E\u8A08\u7B97\u306B\u4F7F\u7528\u3057\u307E\u3059\u3002\u5B9F\u969B\u306E\u5951\u7D04\u5358\u4FA1\u306B\u5408\u308F\u305B\u3066\u7DE8\u96C6\u3057\u3066\u304F\u3060\u3055\u3044\uFF08\u76EE\u5B89\u5024\u3067\u3059\uFF09\u3002"), /*#__PURE__*/React.createElement("div", {
+    className: "control-title"
+  }, "\u71B1\u6E90\u6A5F\u5668\u306E\u5B9A\u683C\u80FD\u529B (kW)"), /*#__PURE__*/React.createElement("p", {
+    className: "modal-note"
+  }, "\u26A0 \u73FE\u5728\u306F\u4EEE\u306E\u6570\u5024\u304C\u5165\u3063\u3066\u3044\u307E\u3059\u3002\u7AE3\u5DE5\u56F3\u30FB\u6A5F\u5668\u30EA\u30B9\u30C8\u306B\u8A18\u8F09\u306E\u5B9F\u969B\u306E\u5B9A\u683C\u80FD\u529B\u306B\u7F6E\u304D\u63DB\u3048\u3066\u304F\u3060\u3055\u3044\u3002\u30C0\u30C3\u30B7\u30E5\u30DC\u30FC\u30C9\u306E\u300C\u8A2D\u5099\u7A3C\u50CD\u7387\u300D\u306E\u8A08\u7B97\u306B\u4F7F\u7528\u3057\u307E\u3059\u3002"), /*#__PURE__*/React.createElement("div", {
+    className: "modal-actions",
+    style: {
+      justifyContent: "flex-start"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => equipFileRef.current && equipFileRef.current.click(),
+    disabled: extractStatus === "loading"
+  }, extractStatus === "loading" ? "🤖 読み取り中…" : "📄 機器表(PDF/画像)から自動入力"), /*#__PURE__*/React.createElement("input", {
+    type: "file",
+    ref: equipFileRef,
+    accept: MONITOR_FILE_ACCEPT,
+    style: {
+      display: "none"
+    },
+    onChange: e => {
+      handleExtractEquipFile(e.target.files[0]);
+      e.target.value = "";
+    }
+  })), extractMessage && /*#__PURE__*/React.createElement("div", {
+    className: "modal-status"
+  }, extractMessage), /*#__PURE__*/React.createElement("div", {
+    className: "form-row"
+  }, /*#__PURE__*/React.createElement("label", null, "\u51B7\u6E29\u6C34\u767A\u751F\u5668No.1"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: form.chiller1CapacityKW,
+    onChange: e => setForm({
+      ...form,
+      chiller1CapacityKW: Number(e.target.value)
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "form-row"
+  }, /*#__PURE__*/React.createElement("label", null, "\u51B7\u6E29\u6C34\u767A\u751F\u5668No.2"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: form.chiller2CapacityKW,
+    onChange: e => setForm({
+      ...form,
+      chiller2CapacityKW: Number(e.target.value)
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "form-row"
+  }, /*#__PURE__*/React.createElement("label", null, "\u30DC\u30A4\u30E9\u30FCNo.1"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: form.boiler1CapacityKW,
+    onChange: e => setForm({
+      ...form,
+      boiler1CapacityKW: Number(e.target.value)
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "form-row"
+  }, /*#__PURE__*/React.createElement("label", null, "\u30DC\u30A4\u30E9\u30FCNo.2"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: form.boiler2CapacityKW,
+    onChange: e => setForm({
+      ...form,
+      boiler2CapacityKW: Number(e.target.value)
+    })
+  })), /*#__PURE__*/React.createElement("div", {
     className: "settings-backup-section"
   }, /*#__PURE__*/React.createElement("div", {
     className: "control-title"
@@ -1934,6 +2178,7 @@ function DayEntryForm({
     className: "entry-form-input-wrap"
   }, /*#__PURE__*/React.createElement("input", {
     type: "number",
+    inputMode: "decimal",
     step: fld.step,
     value: form[fld.key],
     onChange: e => handleChange(fld.key, e.target.value),
@@ -1988,7 +2233,8 @@ function DataEntryView({
   notes,
   onSaveNote,
   monitorFiles,
-  onDeleteMonitorFile
+  onDeleteMonitorFile,
+  onOpenMonitorPreview
 }) {
   const dataByDate = useMemo(() => {
     const m = {};
@@ -2005,9 +2251,7 @@ function DataEntryView({
   const [showNotesList, setShowNotesList] = useState(false);
   const [showMissingDays, setShowMissingDays] = useState(false);
   const [showMonitorList, setShowMonitorList] = useState(false);
-  const [previewMonitorDate, setPreviewMonitorDate] = useState(null);
   const monitorDateSet = useMemo(() => new Set(monitorFiles.map(f => f.date)), [monitorFiles]);
-  const previewMonitorFiles = useMemo(() => previewMonitorDate ? monitorFiles.filter(f => f.date === previewMonitorDate) : [], [monitorFiles, previewMonitorDate]);
   const handleDeleteMonitorFile = (dateStr, fileId) => {
     onDeleteMonitorFile(dateStr, fileId);
   };
@@ -2103,7 +2347,7 @@ function DataEntryView({
       title: "\u4E2D\u592E\u76E3\u8996\u753B\u9762\u3042\u308A\uFF08\u30AF\u30EA\u30C3\u30AF\u3067\u30D7\u30EC\u30D3\u30E5\u30FC\uFF09",
       onClick: e => {
         e.stopPropagation();
-        setPreviewMonitorDate(dateStr);
+        onOpenMonitorPreview(dateStr);
       }
     }, "\uD83D\uDDA5"), hasNote && /*#__PURE__*/React.createElement("span", {
       className: "entry-cal-note-icon",
@@ -2194,12 +2438,7 @@ function DataEntryView({
   }), showMonitorList && /*#__PURE__*/React.createElement(MonitorFilesListModal, {
     files: monitorFiles,
     onClose: () => setShowMonitorList(false),
-    onPreview: dateStr => setPreviewMonitorDate(dateStr),
-    onDelete: handleDeleteMonitorFile
-  }), previewMonitorDate && /*#__PURE__*/React.createElement(MonitorPreviewModal, {
-    date: previewMonitorDate,
-    files: previewMonitorFiles,
-    onClose: () => setPreviewMonitorDate(null),
+    onPreview: onOpenMonitorPreview,
     onDelete: handleDeleteMonitorFile
   }));
 }
@@ -2269,15 +2508,72 @@ const MONITOR_FILE_TYPES = ["application/pdf", "image/jpeg", "image/jpg", "image
 function MonitorImportModal({
   onClose,
   defaultDate,
-  onUploaded
+  onUploaded,
+  onSavedAndAnalyze,
+  monitorFiles,
+  onOpenExistingPreview
 }) {
   const [date, setDate] = useState(defaultDate);
+  const [calMonth, setCalMonth] = useState(defaultDate.slice(0, 7));
   const [status, setStatus] = useState("");
-  const [selectedFiles, setSelectedFiles] = useState([]); // [{tempId, file, status: compressing|ready|error, errorMsg}]
+  const [selectedFiles, setSelectedFiles] = useState([]); // [{tempId, file, status: compressing|ready|error, errorMsg, previewUrl}]
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [existingPreviews, setExistingPreviews] = useState({}); // fileId -> { url, revoke }
   const fileRef = useRef(null);
   const cameraRef = useRef(null);
+  const monitorDateSet = useMemo(() => new Set(monitorFiles.map(f => f.date)), [monitorFiles]);
+  const existingFilesForDate = useMemo(() => monitorFiles.filter(f => f.date === date), [monitorFiles, date]);
+  // カレンダーの下に表示する「画面を保存した日」一覧（新しい日付順）
+  const savedDatesList = useMemo(() => {
+    const counts = {};
+    monitorFiles.forEach(f => {
+      counts[f.date] = (counts[f.date] || 0) + 1;
+    });
+    return Object.entries(counts).sort((a, b) => a[0] < b[0] ? 1 : -1).map(([d, count]) => ({
+      date: d,
+      count
+    }));
+  }, [monitorFiles]);
+  const pickDate = d => {
+    setDate(d);
+    setCalMonth(d.slice(0, 7));
+  };
+  const shiftCalMonth = delta => {
+    setCalMonth(prev => {
+      const [y, m] = prev.split("-").map(Number);
+      const d = new Date(y, m - 1 + delta, 1);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    });
+  };
+  const calDim = daysInMonth(calMonth);
+  const [calY, calM] = calMonth.split("-").map(Number);
+  const calFirstDow = new Date(calY, calM - 1, 1).getDay();
+  const calCells = [];
+  for (let i = 0; i < calFirstDow; i++) calCells.push(null);
+  for (let d = 1; d <= calDim; d++) calCells.push(`${calMonth}-${String(d).padStart(2, "0")}`);
+
+  // 選択中の日付にすでに登録済みのファイルがあれば、サムネイルを読み込んで表示する。
+  useEffect(() => {
+    let cancelled = false;
+    const revokeUrls = [];
+    setExistingPreviews({});
+    existingFilesForDate.forEach(f => {
+      monitorGetPreviewSrc(date, f.fileId).then(result => {
+        if (cancelled || !result) return;
+        if (result.revoke) revokeUrls.push(result.url);
+        setExistingPreviews(prev => ({
+          ...prev,
+          [f.fileId]: result.url
+        }));
+      }).catch(() => {});
+    });
+    return () => {
+      cancelled = true;
+      revokeUrls.forEach(u => URL.revokeObjectURL(u));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, existingFilesForDate.map(f => f.fileId).join(",")]);
   const acceptFiles = fileList => {
     const files = Array.from(fileList || []);
     files.forEach(async file => {
@@ -2289,7 +2585,8 @@ function MonitorImportModal({
       setSelectedFiles(prev => [...prev, {
         tempId,
         file,
-        status: "compressing"
+        status: "compressing",
+        previewUrl: null
       }]);
       try {
         const processed = await compressImageFile(file, MONITOR_IMAGE_MAX_DIM, MONITOR_IMAGE_QUALITY);
@@ -2301,10 +2598,12 @@ function MonitorImportModal({
           } : f));
           return;
         }
+        const previewUrl = URL.createObjectURL(processed);
         setSelectedFiles(prev => prev.map(f => f.tempId === tempId ? {
           ...f,
           file: processed,
-          status: "ready"
+          status: "ready",
+          previewUrl
         } : f));
       } catch (e) {
         setSelectedFiles(prev => prev.map(f => f.tempId === tempId ? {
@@ -2315,9 +2614,17 @@ function MonitorImportModal({
       }
     });
   };
-  const removeSelected = tempId => setSelectedFiles(prev => prev.filter(f => f.tempId !== tempId));
+  const removeSelected = tempId => setSelectedFiles(prev => {
+    const target = prev.find(f => f.tempId === tempId);
+    if (target && target.previewUrl) URL.revokeObjectURL(target.previewUrl);
+    return prev.filter(f => f.tempId !== tempId);
+  });
   const readyFiles = selectedFiles.filter(f => f.status === "ready");
-  const handleUpload = async () => {
+
+  // andAnalyze=trueの場合（「保存してGemini分析」）は、保存後この取り込みモーダルを閉じて
+  // プレビュー画面（Gemini分析ボタン群がある画面）を開く。andAnalyze=false（「保存のみ」）は
+  // 従来通りこのモーダルを開いたまま完了メッセージだけ表示する。
+  const handleUpload = async andAnalyze => {
     if (!date) {
       setStatus("対象日を選択してください。");
       return;
@@ -2331,32 +2638,97 @@ function MonitorImportModal({
       for (const f of readyFiles) {
         await monitorSaveFile(date, genMonitorFileId(), f.file);
       }
-      setStatus(`${date} に${readyFiles.length}枚保存しました（データ入力画面のカレンダーからプレビューできます）。`);
+      readyFiles.forEach(f => {
+        if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+      });
+      const savedDate = date;
+      const savedCount = readyFiles.length;
       setSelectedFiles([]);
       if (fileRef.current) fileRef.current.value = "";
       if (cameraRef.current) cameraRef.current.value = "";
       onUploaded();
+      if (andAnalyze) {
+        onSavedAndAnalyze(savedDate);
+      } else {
+        setStatus(`${savedDate} に${savedCount}枚保存しました（データ入力画面のカレンダーからプレビューできます）。`);
+      }
     } catch (e) {
       setStatus("保存エラー: " + e.message);
     } finally {
       setUploading(false);
     }
   };
-  return /*#__PURE__*/React.createElement("div", {
-    className: "modal-backdrop",
-    onClick: onClose
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "modal",
-    onClick: e => e.stopPropagation()
+  return /*#__PURE__*/React.createElement("section", {
+    className: "monitor-import-panel"
   }, /*#__PURE__*/React.createElement("h3", null, "\u4E2D\u592E\u76E3\u8996\u753B\u9762\u53D6\u308A\u8FBC\u307F"), /*#__PURE__*/React.createElement("p", {
     className: "modal-note"
-  }, "\u4E2D\u592E\u76E3\u8996\u88C5\u7F6E\u306E\u71B1\u6E90\u753B\u9762\uFF08PDF\u30FBJPEG\u30FBPNG\u3001\u8907\u6570\u53EF\uFF09\u3092\u65E5\u4ED8\u3054\u3068\u306B\u53D6\u308A\u8FBC\u307F\u307E\u3059\u3002\u753B\u50CF\u306F\u81EA\u52D5\u7684\u306B \u5727\u7E2E\u30FB\u7E2E\u5C0F\u3055\u308C\u3066\u304B\u3089\u4FDD\u5B58\u3055\u308C\u307E\u3059\u3002", monitorSyncEnabled ? "Firebaseに保存され、他端末とも共有されます。" : "この端末（ブラウザ）内にのみ保存されます。", "\u300C\u30C7\u30FC\u30BF\u5165\u529B\u300D\u753B\u9762\u306E\u30AB\u30EC\u30F3\u30C0\u30FC\u304B\u3089\u30D7\u30EC\u30D3\u30E5\u30FC\u3067\u304D\u307E\u3059\u3002"), /*#__PURE__*/React.createElement("div", {
+  }, "\u4E2D\u592E\u76E3\u8996\u88C5\u7F6E\u306E\u71B1\u6E90\u753B\u9762\uFF08PDF\u30FBJPEG\u30FBPNG\u3001\u8907\u6570\u53EF\uFF09\u3092\u65E5\u4ED8\u3054\u3068\u306B\u53D6\u308A\u8FBC\u307F\u307E\u3059\u3002\u753B\u50CF\u306F\u81EA\u52D5\u7684\u306B \u5727\u7E2E\u30FB\u7E2E\u5C0F\u3055\u308C\u3066\u304B\u3089\u4FDD\u5B58\u3055\u308C\u307E\u3059\u3002", monitorSyncEnabled ? "Firebaseに保存され、他端末とも共有されます。" : "この端末（ブラウザ）内にのみ保存されます。"), /*#__PURE__*/React.createElement("div", {
     className: "form-row"
   }, /*#__PURE__*/React.createElement("label", null, "\u5BFE\u8C61\u65E5"), /*#__PURE__*/React.createElement("input", {
     type: "date",
     value: date,
-    onChange: e => setDate(e.target.value)
-  })), /*#__PURE__*/React.createElement("div", {
+    onChange: e => pickDate(e.target.value)
+  })), selectedFiles.length === 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-cal"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-cal-header"
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: () => shiftCalMonth(-1)
+  }, "\u25C0 \u524D\u6708"), /*#__PURE__*/React.createElement("div", null, calY, "\u5E74", calM, "\u6708"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: () => shiftCalMonth(1)
+  }, "\u7FCC\u6708 \u25B6")), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-cal-grid monitor-import-cal-dow"
+  }, ["日", "月", "火", "水", "木", "金", "土"].map(w => /*#__PURE__*/React.createElement("div", {
+    key: w
+  }, w))), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-cal-grid"
+  }, calCells.map((d, i) => d ? /*#__PURE__*/React.createElement("button", {
+    key: d,
+    className: "monitor-import-cal-cell" + (d === date ? " selected" : ""),
+    onClick: () => pickDate(d)
+  }, Number(d.slice(-2)), monitorDateSet.has(d) && /*#__PURE__*/React.createElement("span", {
+    className: "monitor-import-cal-dot"
+  }, "\uD83D\uDDA5")) : /*#__PURE__*/React.createElement("div", {
+    key: "empty" + i,
+    className: "monitor-import-cal-cell empty"
+  })))), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-saved-list"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-saved-list-title"
+  }, "\u753B\u9762\u3092\u4FDD\u5B58\u3057\u305F\u65E5\uFF08", savedDatesList.length, "\u65E5\uFF09"), savedDatesList.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "modal-note"
+  }, "\u307E\u3060\u767B\u9332\u304C\u3042\u308A\u307E\u305B\u3093\u3002") : /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-saved-list-items"
+  }, savedDatesList.map(s => /*#__PURE__*/React.createElement("button", {
+    key: s.date,
+    className: "monitor-import-saved-list-item" + (s.date === date ? " selected" : ""),
+    onClick: () => pickDate(s.date)
+  }, s.date, s.count > 1 && ` (${s.count}件)`)))), existingFilesForDate.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-existing"
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "modal-note"
+  }, "\u3053\u306E\u65E5\u306B\u306F\u3059\u3067\u306B", existingFilesForDate.length, "\u4EF6\u767B\u9332\u3055\u308C\u3066\u3044\u307E\u3059\uFF08\u30AF\u30EA\u30C3\u30AF\u3057\u3066\u958B\u304F\uFF09\uFF1A"), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-list"
+  }, existingFilesForDate.map(f => /*#__PURE__*/React.createElement("div", {
+    key: f.fileId,
+    className: "monitor-preview-item monitor-preview-item-clickable",
+    onClick: () => onOpenExistingPreview && onOpenExistingPreview(date)
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-thumb"
+  }, existingPreviews[f.fileId] && (f.fileType === "application/pdf" ? /*#__PURE__*/React.createElement("iframe", {
+    src: existingPreviews[f.fileId],
+    className: "monitor-preview-item-pdf",
+    title: f.fileName
+  }) : /*#__PURE__*/React.createElement("img", {
+    src: existingPreviews[f.fileId],
+    alt: f.fileName
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-info"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-name"
+  }, f.fileName))))))), /*#__PURE__*/React.createElement("div", {
     className: "monitor-dropzone" + (dragOver ? " drag-over" : ""),
     onClick: () => fileRef.current && fileRef.current.click(),
     onDragOver: e => {
@@ -2381,20 +2753,7 @@ function MonitorImportModal({
       acceptFiles(e.target.files);
       e.target.value = "";
     }
-  })), selectedFiles.length > 0 && /*#__PURE__*/React.createElement("ul", {
-    className: "monitor-selected-list"
-  }, selectedFiles.map(f => /*#__PURE__*/React.createElement("li", {
-    key: f.tempId
-  }, /*#__PURE__*/React.createElement("span", null, f.file.name), f.status === "compressing" && /*#__PURE__*/React.createElement("span", {
-    className: "monitor-selected-status"
-  }, " \u5727\u7E2E\u4E2D\u2026"), f.status === "ready" && /*#__PURE__*/React.createElement("span", {
-    className: "monitor-selected-status"
-  }, "\uFF08", Math.round(f.file.size / 1024), "KB\uFF09"), f.status === "error" && /*#__PURE__*/React.createElement("span", {
-    className: "monitor-selected-status error"
-  }, " \u26A0 ", f.errorMsg), /*#__PURE__*/React.createElement("button", {
-    className: "btn btn-small",
-    onClick: () => removeSelected(f.tempId)
-  }, "\xD7")))), /*#__PURE__*/React.createElement("div", {
+  })), /*#__PURE__*/React.createElement("div", {
     className: "modal-actions",
     style: {
       justifyContent: "flex-start"
@@ -2405,7 +2764,7 @@ function MonitorImportModal({
       e.stopPropagation();
       cameraRef.current && cameraRef.current.click();
     }
-  }, "\uD83D\uDCF7 \u30AB\u30E1\u30E9\u3067\u64AE\u5F71"), /*#__PURE__*/React.createElement("input", {
+  }, selectedFiles.length > 0 ? "📷 続けてカメラ撮影する" : "📷 カメラで撮影"), /*#__PURE__*/React.createElement("input", {
     type: "file",
     ref: cameraRef,
     accept: "image/*",
@@ -2417,23 +2776,60 @@ function MonitorImportModal({
       acceptFiles(e.target.files);
       e.target.value = "";
     }
-  })), /*#__PURE__*/React.createElement("div", {
+  })), selectedFiles.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "monitor-import-preview-step"
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "modal-note"
+  }, "\u3053\u306E\u753B\u50CF\u3067\u4FDD\u5B58\u3057\u307E\u3059\u304B\uFF1F\uFF08\u5BFE\u8C61\u65E5: ", date, "\uFF09"), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-list monitor-preview-list-large"
+  }, selectedFiles.map(f => /*#__PURE__*/React.createElement("div", {
+    key: f.tempId,
+    className: "monitor-preview-item"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-thumb"
+  }, f.status === "ready" && f.previewUrl && (f.file.type === "application/pdf" ? /*#__PURE__*/React.createElement("iframe", {
+    src: f.previewUrl,
+    className: "monitor-preview-item-pdf",
+    title: f.file.name
+  }) : /*#__PURE__*/React.createElement("img", {
+    src: f.previewUrl,
+    alt: f.file.name
+  })), f.status === "compressing" && /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-loading"
+  }, "\u5727\u7E2E\u4E2D\u2026"), f.status === "error" && /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-error"
+  }, "\u26A0")), /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-info"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "monitor-preview-item-name"
+  }, f.file.name), f.status === "ready" && /*#__PURE__*/React.createElement("div", {
+    className: "monitor-selected-status"
+  }, Math.round(f.file.size / 1024), "KB"), f.status === "error" && /*#__PURE__*/React.createElement("div", {
+    className: "monitor-selected-status error"
+  }, f.errorMsg), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: () => removeSelected(f.tempId)
+  }, "\xD7 \u524A\u9664"))))), /*#__PURE__*/React.createElement("div", {
     className: "modal-actions",
     style: {
       justifyContent: "flex-start"
     }
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn btn-primary",
-    onClick: handleUpload,
-    disabled: uploading
-  }, uploading ? "保存中…" : `保存${readyFiles.length > 0 ? `（${readyFiles.length}枚）` : ""}`)), status && /*#__PURE__*/React.createElement("div", {
+    onClick: () => handleUpload(false),
+    disabled: uploading || readyFiles.length === 0
+  }, uploading ? "保存中…" : `保存のみ${readyFiles.length > 0 ? `（${readyFiles.length}枚）` : ""}`), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => handleUpload(true),
+    disabled: uploading || readyFiles.length === 0
+  }, uploading ? "保存中…" : "🤖 保存してGeminiで分析"))), status && /*#__PURE__*/React.createElement("div", {
     className: "modal-status"
   }, status), /*#__PURE__*/React.createElement("div", {
     className: "modal-actions"
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn",
     onClick: onClose
-  }, "\u9589\u3058\u308B"))));
+  }, "\u9589\u3058\u308B")));
 }
 function MonitorFilesListModal({
   files,
@@ -2476,16 +2872,41 @@ function MonitorFilesListModal({
 
 // 1日に複数の中央監視画面が登録されている場合、まとめてプレビューし、画面ごとの個別分析と
 // 全画面を踏まえた総括の両方をGeminiに依頼できるようにしている。
+// 最適運転アドバイスに付随するLOAD_TABLEをHTMLの表として描画する。
+function LoadTableView({
+  table
+}) {
+  if (!table || !table.length) return null;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "entry-list-scroll",
+    style: {
+      marginTop: 6
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "entry-list-table load-table"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    className: "entry-list-datecol"
+  }, "\u6A5F\u5668"), /*#__PURE__*/React.createElement("th", null, "\u51FA\u529B(kW)"), /*#__PURE__*/React.createElement("th", null, "\u5B9A\u683C(kW)"), /*#__PURE__*/React.createElement("th", null, "\u8CA0\u8377\u7387(%)"))), /*#__PURE__*/React.createElement("tbody", null, table.map((row, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i
+  }, /*#__PURE__*/React.createElement("td", {
+    className: "entry-list-datecol"
+  }, row.name || "-"), /*#__PURE__*/React.createElement("td", null, row.outputKW != null ? fmtNum(row.outputKW, 0) : "-"), /*#__PURE__*/React.createElement("td", null, row.capacityKW != null ? fmtNum(row.capacityKW, 0) : "-"), /*#__PURE__*/React.createElement("td", null, row.loadPct != null ? fmtNum(row.loadPct, 1) : "-"))))));
+}
 function MonitorPreviewModal({
   date,
   files,
+  settings,
   onClose,
   onDelete
 }) {
   const [previews, setPreviews] = useState({}); // fileId -> { url, status }
   const [fileComments, setFileComments] = useState({}); // fileId -> { status, comment }
+  const [adviceState, setAdviceState] = useState({}); // fileId -> { status, comment }
   const [summaryStatus, setSummaryStatus] = useState("idle"); // idle | loading | done | error
   const [summaryComment, setSummaryComment] = useState("");
+  const [multiAdviceStatus, setMultiAdviceStatus] = useState("idle"); // idle | loading | done | error
+  const [multiAdviceComment, setMultiAdviceComment] = useState("");
+  const [multiAdviceTable, setMultiAdviceTable] = useState(null);
   useEffect(() => {
     let cancelled = false;
     const revokeUrls = [];
@@ -2493,6 +2914,9 @@ function MonitorPreviewModal({
     setFileComments({});
     setSummaryStatus("idle");
     setSummaryComment("");
+    setMultiAdviceStatus("idle");
+    setMultiAdviceComment("");
+    setMultiAdviceTable(null);
     files.forEach(f => {
       setPreviews(prev => ({
         ...prev,
@@ -2568,6 +2992,42 @@ function MonitorPreviewModal({
       throw e;
     }
   };
+  const analyzeOptimalOperation = async f => {
+    setAdviceState(prev => ({
+      ...prev,
+      [f.fileId]: {
+        status: "loading",
+        comment: "",
+        table: null
+      }
+    }));
+    try {
+      const dataUrl = await monitorGetFileDataUrl(date, f.fileId);
+      if (!dataUrl) throw new Error("画像データが見つかりませんでした。");
+      const raw = await fetchGeminiImageComment(buildOptimalOperationPrompt(date, f.fileName, settings), dataUrl, f.fileType);
+      const {
+        comment,
+        table
+      } = parseLoadTable(raw);
+      setAdviceState(prev => ({
+        ...prev,
+        [f.fileId]: {
+          status: "done",
+          comment,
+          table
+        }
+      }));
+    } catch (e) {
+      setAdviceState(prev => ({
+        ...prev,
+        [f.fileId]: {
+          status: "error",
+          comment: e.message,
+          table: null
+        }
+      }));
+    }
+  };
   const handleSummarize = async () => {
     setSummaryStatus("loading");
     try {
@@ -2583,6 +3043,35 @@ function MonitorPreviewModal({
     } catch (e) {
       setSummaryComment(e.message);
       setSummaryStatus("error");
+    }
+  };
+
+  // 全画像を1回のGemini呼び出しでまとめて渡し、画面をまたいだ機器も含めて横断的に
+  // 最適運転アドバイスをもらう（監視画面が1枚に収まらない場合など）。
+  const handleMultiAdvice = async () => {
+    setMultiAdviceStatus("loading");
+    try {
+      const images = [];
+      for (const f of files) {
+        const dataUrl = await monitorGetFileDataUrl(date, f.fileId);
+        if (dataUrl) images.push({
+          dataUrl,
+          mimeType: f.fileType
+        });
+      }
+      if (!images.length) throw new Error("画像データが見つかりませんでした。");
+      const raw = await fetchGeminiMultiImageComment(buildOptimalOperationMultiPrompt(date, files.map(f => f.fileName), settings), images);
+      const {
+        comment,
+        table
+      } = parseLoadTable(raw);
+      setMultiAdviceComment(comment);
+      setMultiAdviceTable(table);
+      setMultiAdviceStatus("done");
+    } catch (e) {
+      setMultiAdviceComment(e.message);
+      setMultiAdviceTable(null);
+      setMultiAdviceStatus("error");
     }
   };
   return /*#__PURE__*/React.createElement("div", {
@@ -2606,11 +3095,27 @@ function MonitorPreviewModal({
     disabled: summaryStatus === "loading"
   }, summaryStatus === "loading" ? "🤖 総括中…" : "🤖 Geminiで総括（全画面まとめて分析）"), summaryComment && /*#__PURE__*/React.createElement("p", {
     className: "analysis-note ai-comment" + (summaryStatus === "error" ? " ai-comment-error" : "")
-  }, summaryStatus === "error" ? "⚠ " : "📋 ", summaryComment)), files.map(f => {
+  }, summaryStatus === "error" ? "⚠ " : "📋 ", summaryComment), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-small",
+    onClick: handleMultiAdvice,
+    disabled: multiAdviceStatus === "loading",
+    style: {
+      marginTop: 8
+    }
+  }, multiAdviceStatus === "loading" ? "🤖 提案作成中…" : "🤖 最適運転アドバイス（全画面まとめて）"), multiAdviceComment && /*#__PURE__*/React.createElement("p", {
+    className: "analysis-note ai-comment" + (multiAdviceStatus === "error" ? " ai-comment-error" : "")
+  }, multiAdviceStatus === "error" ? "⚠ " : "💡 ", multiAdviceComment), /*#__PURE__*/React.createElement(LoadTableView, {
+    table: multiAdviceTable
+  })), files.map(f => {
     const preview = previews[f.fileId] || {};
     const aiState = fileComments[f.fileId] || {
       status: "idle",
       comment: ""
+    };
+    const advice = adviceState[f.fileId] || {
+      status: "idle",
+      comment: "",
+      table: null
     };
     return /*#__PURE__*/React.createElement("div", {
       key: f.fileId,
@@ -2619,7 +3124,9 @@ function MonitorPreviewModal({
       className: "monitor-file-card-header"
     }, /*#__PURE__*/React.createElement("div", {
       className: "panel-title"
-    }, f.fileName), preview.url && /*#__PURE__*/React.createElement("a", {
+    }, f.fileName), /*#__PURE__*/React.createElement("div", {
+      className: "monitor-file-card-actions"
+    }, preview.url && /*#__PURE__*/React.createElement("a", {
       className: "btn btn-small",
       href: preview.url,
       download: f.fileName,
@@ -2628,7 +3135,7 @@ function MonitorPreviewModal({
     }, "\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9"), /*#__PURE__*/React.createElement("button", {
       className: "btn btn-small btn-ghost-red",
       onClick: () => onDelete(date, f.fileId)
-    }, "\u524A\u9664")), /*#__PURE__*/React.createElement("div", {
+    }, "\u524A\u9664"))), /*#__PURE__*/React.createElement("div", {
       className: "monitor-preview-body"
     }, preview.status && /*#__PURE__*/React.createElement("div", {
       className: "analysis-empty"
@@ -2644,11 +3151,18 @@ function MonitorPreviewModal({
       className: "ai-gemini-box monitor-ai-box"
     }, /*#__PURE__*/React.createElement("button", {
       className: "btn btn-small",
-      onClick: () => analyzeOneFile(f),
-      disabled: aiState.status === "loading"
-    }, aiState.status === "loading" ? "🤖 画像分析中…" : "🤖 Geminiで画像分析"), aiState.comment && /*#__PURE__*/React.createElement("p", {
+      onClick: () => {
+        analyzeOneFile(f);
+        analyzeOptimalOperation(f);
+      },
+      disabled: aiState.status === "loading" || advice.status === "loading"
+    }, aiState.status === "loading" || advice.status === "loading" ? "🤖 分析中…" : "🤖 Geminiで分析"), aiState.comment && /*#__PURE__*/React.createElement("p", {
       className: "analysis-note ai-comment" + (aiState.status === "error" ? " ai-comment-error" : "")
-    }, aiState.status === "error" ? "⚠ " : "🤖 ", aiState.comment)));
+    }, aiState.status === "error" ? "⚠ " : "🤖 ", aiState.comment), advice.comment && /*#__PURE__*/React.createElement("p", {
+      className: "analysis-note ai-comment" + (advice.status === "error" ? " ai-comment-error" : "")
+    }, advice.status === "error" ? "⚠ " : "💡 ", advice.comment), /*#__PURE__*/React.createElement(LoadTableView, {
+      table: advice.table
+    })));
   })));
 }
 
@@ -2670,12 +3184,14 @@ function GranularityToggle({
 }
 function AiCommentBox({
   buildPrompt,
-  onAddChart
+  onAddChart,
+  autoRunKey
 }) {
   const [status, setStatus] = useState("idle"); // idle | loading | done | error
   const [comment, setComment] = useState("");
   const [suggestedKeys, setSuggestedKeys] = useState(null);
   const [chartAdded, setChartAdded] = useState(false);
+  const lastAutoRunKeyRef = useRef(null);
   const handleClick = async () => {
     setStatus("loading");
     setSuggestedKeys(null);
@@ -2700,6 +3216,15 @@ function AiCommentBox({
     onAddChart(suggestedKeys, chartName);
     setChartAdded(true);
   };
+
+  // ダッシュボードの注意事項バナーから「分析で詳しく見る」を選んだ場合など、外部から
+  // 指定されたキーが新しく届いたときだけ自動的に分析を実行する（同じキーでは再実行しない）。
+  useEffect(() => {
+    if (autoRunKey == null || lastAutoRunKeyRef.current === autoRunKey) return;
+    lastAutoRunKeyRef.current = autoRunKey;
+    handleClick();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRunKey]);
   return /*#__PURE__*/React.createElement("div", {
     className: "ai-gemini-box"
   }, /*#__PURE__*/React.createElement("button", {
@@ -2722,11 +3247,33 @@ function AnalysisView({
   settings,
   darkMode,
   notes,
-  onSaveNote
+  onSaveNote,
+  focus
 }) {
   const fiscalYears = useMemo(() => Array.from(new Set(data.map(r => fiscalYear(r.date)))).sort((a, b) => a - b), [data]);
   const [fy, setFy] = useState(() => fiscalYears[fiscalYears.length - 1]);
   const [anomalyMetric, setAnomalyMetric] = useState("elecKWh");
+  const anomalyPanelRef = useRef(null);
+  const demandPanelRef = useRef(null);
+  const handledFocusTokenRef = useRef(null);
+
+  // ダッシュボードの注意事項バナーから「分析で詳しく見る」で来た場合、該当する項目
+  // （異常値検知パネルなら該当metric、デマンド超過ならデマンドパネル）までスクロールする。
+  useEffect(() => {
+    if (!focus || !focus.token || handledFocusTokenRef.current === focus.token) return;
+    if (focus.type === "anomaly" && focus.metric && anomalyMetric !== focus.metric) {
+      setAnomalyMetric(focus.metric);
+      return; // anomalyMetricが更新された次のレンダーで再度この副作用が走る
+    }
+    handledFocusTokenRef.current = focus.token;
+    const targetRef = focus.type === "anomaly" ? anomalyPanelRef : demandPanelRef;
+    requestAnimationFrame(() => {
+      if (targetRef.current) targetRef.current.scrollIntoView({
+        behavior: "smooth",
+        block: "start"
+      });
+    });
+  }, [focus, anomalyMetric]);
   const [heatmapMetric, setHeatmapMetric] = useState("elecKWh");
   const [overlayMetric, setOverlayMetric] = useState("elecKWh");
   const [overlayYears, setOverlayYears] = useState(() => fiscalYears.slice(-3));
@@ -2735,6 +3282,7 @@ function AnalysisView({
   const [intensityGranularity, setIntensityGranularity] = useState("month");
   const [co2Granularity, setCo2Granularity] = useState("month");
   const [demandGranularity, setDemandGranularity] = useState("day");
+  const [compareDate, setCompareDate] = useState(() => data.length ? data[data.length - 1].date : "");
   const monthKeys = useMemo(() => fiscalMonthKeys(fy), [fy]);
   const fyRows = useMemo(() => data.filter(r => fiscalYear(r.date) === fy), [data, fy]);
   const prevFyRows = useMemo(() => data.filter(r => fiscalYear(r.date) === fy - 1), [data, fy]);
@@ -2747,6 +3295,55 @@ function AnalysisView({
     });
     return m;
   }, [data]);
+
+  // 12. 日付比較分析：選択した日付を基準に、前日・前週・前月・前年の同項目と比較する
+  const dateCompare = useMemo(() => {
+    if (!compareDate) return null;
+    const baseRow = byDate[compareDate] || null;
+    const periods = [{
+      key: "prevDay",
+      label: "前日",
+      date: addDays(compareDate, -1)
+    }, {
+      key: "prevWeek",
+      label: "前週",
+      date: addDays(compareDate, -7)
+    }, {
+      key: "prevMonth",
+      label: "前月",
+      date: addMonthsClamped(compareDate, -1)
+    }, {
+      key: "prevYear",
+      label: "前年",
+      date: addMonthsClamped(compareDate, -12)
+    }];
+    const rows = DASHBOARD_KPI_KEYS.map(key => {
+      const meta = METRICS[key];
+      const baseVal = baseRow && baseRow[key] != null && !isNaN(baseRow[key]) ? baseRow[key] : null;
+      const comps = periods.map(p => {
+        const cmpRow = byDate[p.date];
+        const cmpVal = cmpRow && cmpRow[key] != null && !isNaN(cmpRow[key]) ? cmpRow[key] : null;
+        const pct = baseVal != null && cmpVal != null && cmpVal !== 0 ? (baseVal - cmpVal) / cmpVal * 100 : null;
+        return {
+          ...p,
+          value: cmpVal,
+          pct
+        };
+      });
+      return {
+        key,
+        label: meta.label,
+        unit: meta.unit,
+        baseValue: baseVal,
+        comps
+      };
+    });
+    return {
+      baseRow,
+      periods,
+      rows
+    };
+  }, [compareDate, byDate]);
 
   // グラフごとの日/月/年切替：選択中の年度内の日次、年度内の月次、または全年度の年次で束ねる
   const granularityData = gran => {
@@ -3480,7 +4077,8 @@ function AnalysisView({
   }, "\uD83D\uDCAC ", intensityComment), /*#__PURE__*/React.createElement(AiCommentBox, {
     buildPrompt: () => buildAnalysisPrompt("原単位トレンド（電力・重油）", `電力原単位(kWh/GJ): ${seriesText(intensityData.labels, intensityData.elec, "")}\n重油原単位(L/GJ): ${seriesText(intensityData.labels, intensityData.oil, "")}`)
   })), /*#__PURE__*/React.createElement("section", {
-    className: "chart-panel"
+    className: "chart-panel",
+    ref: anomalyPanelRef
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-title-row"
   }, /*#__PURE__*/React.createElement("div", {
@@ -3497,6 +4095,7 @@ function AnalysisView({
   }, "\u5168\u671F\u9593\u30C7\u30FC\u30BF\u3067\u300C\u5916\u6C17\u6E29\u5EA6\u2192", anomaly.meta.label, "\u300D\u306E\u56DE\u5E30\u30E2\u30C7\u30EB\u3092\u4F5C\u308A\u3001\u4E88\u6E2C\u304B\u3089\u5927\u304D\u304F\u5916\u308C\u305F\u65E5\u3092\u691C\u51FA\u3057\u307E\u3059\uFF08\u8A2D\u5099\u7570\u5E38\u30FB\u8AA4\u8A18\u9332\u306E\u65E9\u671F\u767A\u898B\u7528\uFF09\u3002"), /*#__PURE__*/React.createElement("p", {
     className: "analysis-note ai-comment"
   }, "\uD83D\uDCAC ", anomalyComment), /*#__PURE__*/React.createElement(AiCommentBox, {
+    autoRunKey: focus && focus.type === "anomaly" && focus.metric === anomalyMetric ? focus.token : null,
     buildPrompt: () => buildAnalysisPrompt(`異常値検知（${anomaly.meta.label}）`, anomaly.list.length === 0 ? "異常日は検出されていません。" : anomaly.list.slice(0, 5).map(x => `${x.date}: 実績${fmtNum(x.actual, 0)}${anomaly.meta.unit}, 回帰予測${fmtNum(x.pred, 0)}${anomaly.meta.unit}, 乖離${fmtNum(x.sigma, 1)}σ`).join("\n"))
   }), anomaly.list.length === 0 ? /*#__PURE__*/React.createElement("div", {
     className: "analysis-empty"
@@ -3506,8 +4105,10 @@ function AnalysisView({
     const noteMsg = `異常値検知: ${anomaly.meta.label} ${fmtNum(x.actual, 0)}${anomaly.meta.unit}（回帰予測比 ${x.sigma > 0 ? "+" : ""}${fmtNum(x.sigma, 1)}σ）`;
     const existing = notes && notes[x.date];
     const alreadyRecorded = existing && existing.includes(noteMsg);
+    const isFocused = focus && focus.type === "anomaly" && focus.metric === anomalyMetric && focus.date === x.date;
     return /*#__PURE__*/React.createElement("tr", {
-      key: x.date
+      key: x.date,
+      className: isFocused ? "row-focused" : ""
     }, /*#__PURE__*/React.createElement("td", null, x.date), /*#__PURE__*/React.createElement("td", null, fmtNum(x.temp, 1), "\u2103"), /*#__PURE__*/React.createElement("td", null, fmtNum(x.actual, 0), " ", anomaly.meta.unit), /*#__PURE__*/React.createElement("td", null, fmtNum(x.pred, 0), " ", anomaly.meta.unit), /*#__PURE__*/React.createElement("td", {
       className: x.sigma > 0 ? "dev-up" : "dev-down"
     }, x.sigma > 0 ? "+" : "", fmtNum(x.sigma, 1), "\u03C3"), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("button", {
@@ -3629,7 +4230,8 @@ function AnalysisView({
   }, "\uD83D\uDCAC ", co2Comment), /*#__PURE__*/React.createElement(AiCommentBox, {
     buildPrompt: () => buildAnalysisPrompt("CO2排出量トレンド", seriesText(co2Data.labels, co2Data.current, "t-CO2"))
   })), /*#__PURE__*/React.createElement("section", {
-    className: "chart-panel"
+    className: "chart-panel",
+    ref: demandPanelRef
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-title-row"
   }, /*#__PURE__*/React.createElement("div", {
@@ -3654,6 +4256,7 @@ function AnalysisView({
   })), /*#__PURE__*/React.createElement("p", {
     className: "analysis-note ai-comment"
   }, "\uD83D\uDCAC ", demandComment), /*#__PURE__*/React.createElement(AiCommentBox, {
+    autoRunKey: focus && focus.type === "demand" ? focus.token : null,
     buildPrompt: () => buildAnalysisPrompt("デマンド分析（日平均電力）", seriesText(demandData.labels, demandData.values, "kW") + `\n契約電力: ${fmtNum(settings.contractKW, 0)}kW`)
   }), /*#__PURE__*/React.createElement("div", {
     className: "panel-title",
@@ -3823,6 +4426,40 @@ function AnalysisView({
     }, "\uD83D\uDCAC ", comment), /*#__PURE__*/React.createElement(AiCommentBox, {
       buildPrompt: () => buildAnalysisPrompt(`年間目標への累積進捗（${t.label}）`, seriesText(FM_LABELS, t.actualSeries, t.unit) + `\n目標ペース: ` + seriesText(FM_LABELS, t.paceSeries, t.unit))
     }));
+  })), /*#__PURE__*/React.createElement("section", {
+    className: "chart-panel"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "panel-title"
+  }, "12. \u65E5\u4ED8\u6BD4\u8F03\u5206\u6790\uFF08\u524D\u65E5\u30FB\u524D\u9031\u30FB\u524D\u6708\u30FB\u524D\u5E74\uFF09"), /*#__PURE__*/React.createElement("div", {
+    className: "form-row"
+  }, /*#__PURE__*/React.createElement("label", null, "\u6BD4\u8F03\u3059\u308B\u65E5\u4ED8"), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: compareDate,
+    onChange: e => setCompareDate(e.target.value)
+  })), !dateCompare || !dateCompare.baseRow ? /*#__PURE__*/React.createElement("div", {
+    className: "analysis-empty"
+  }, "\u9078\u629E\u3057\u305F\u65E5\u4ED8\u306E\u5B9F\u7E3E\u30C7\u30FC\u30BF\u304C\u3042\u308A\u307E\u305B\u3093\u3002") : /*#__PURE__*/React.createElement("div", {
+    className: "entry-list-scroll"
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "entry-list-table compare-table"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    className: "entry-list-datecol"
+  }, "\u9805\u76EE"), /*#__PURE__*/React.createElement("th", null, compareDate, /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
+    className: "entry-list-unit"
+  }, "\u57FA\u6E96\u65E5")), dateCompare.periods.map(p => /*#__PURE__*/React.createElement("th", {
+    key: p.key
+  }, p.label, /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
+    className: "entry-list-unit"
+  }, p.date))))), /*#__PURE__*/React.createElement("tbody", null, dateCompare.rows.map(r => /*#__PURE__*/React.createElement("tr", {
+    key: r.key
+  }, /*#__PURE__*/React.createElement("td", {
+    className: "entry-list-datecol"
+  }, r.label), /*#__PURE__*/React.createElement("td", null, r.baseValue != null ? `${fmtNum(r.baseValue, Math.abs(r.baseValue) < 100 ? 1 : 0)} ${r.unit}` : "-"), r.comps.map(c => /*#__PURE__*/React.createElement("td", {
+    key: c.key
+  }, c.value != null ? /*#__PURE__*/React.createElement(React.Fragment, null, fmtNum(c.value, Math.abs(c.value) < 100 ? 1 : 0), " ", r.unit, c.pct != null && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
+    className: "kpi-delta " + (c.pct > 0 ? "up" : c.pct < 0 ? "down" : "")
+  }, fmtPct(c.pct)))) : "データなし"))))))), dateCompare && dateCompare.baseRow && /*#__PURE__*/React.createElement(AiCommentBox, {
+    buildPrompt: () => buildAnalysisPrompt(`${compareDate}の各項目比較（前日・前週・前月・前年）`, dateCompare.rows.map(r => `${r.label}: 基準日${fmtNum(r.baseValue, 1)}${r.unit}` + r.comps.map(c => `／${c.label}比${c.pct != null ? fmtPct(c.pct) : "データなし"}`).join("")).join("\n"))
   })));
 }
 function DataUpdateModal({
@@ -3995,6 +4632,8 @@ function App() {
   const [showMonitorImport, setShowMonitorImport] = useState(false);
   const [monitorFiles, setMonitorFiles] = useState([]);
   const [monitorTick, setMonitorTick] = useState(0);
+  const [previewMonitorDate, setPreviewMonitorDate] = useState(null);
+  const previewMonitorFiles = useMemo(() => previewMonitorDate ? monitorFiles.filter(f => f.date === previewMonitorDate) : [], [monitorFiles, previewMonitorDate]);
 
   // 中央監視画面の一覧：Firebase同期が有効ならリアルタイム購読、そうでなければ
   // IndexedDBから読み込む（monitorTickが変わるたびに再読み込み）。1日に複数ファイルを
@@ -4049,8 +4688,8 @@ function App() {
   const [fullscreenChartId, setFullscreenChartId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showDataUpdate, setShowDataUpdate] = useState(false);
-  const [showReportPreview, setShowReportPreview] = useState(false);
   const [mode, setMode] = useState(() => savedViewState && savedViewState.mode || "dashboard");
+  const [analysisFocus, setAnalysisFocus] = useState(null); // { type: "anomaly"|"demand", metric?, token }
   const [darkMode, setDarkMode] = useState(() => {
     try {
       return localStorage.getItem(LS_DARKMODE_KEY) === "1";
@@ -4084,6 +4723,7 @@ function App() {
         alerts.push({
           key: `demand-${r.date}`,
           date: r.date,
+          type: "demand",
           message: `${r.date}: 日平均電力が契約比${fmtNum(settings.demandAlertPct, 0)}%を超過（契約比${fmtNum(r.demandKW / settings.contractKW * 100, 0)}%）`
         });
       }
@@ -4104,6 +4744,8 @@ function App() {
           alerts.push({
             key: `anomaly-${metricKey}-${r.date}`,
             date: r.date,
+            type: "anomaly",
+            metricKey,
             message: `${r.date}: ${METRICS[metricKey].label}が気温からの予測より${sigma > 0 ? "大幅に多い" : "大幅に少ない"}（${sigma > 0 ? "+" : ""}${fmtNum(sigma, 1)}σ）`
           });
         }
@@ -4498,29 +5140,35 @@ function App() {
     const co2 = (sumMetric(kpiCurrentRows, "elecKWh") * settings.elecCO2PerKWh + sumMetric(kpiCurrentRows, "oilTotalL") * settings.oilCO2PerL) / 1000;
     const crudeOilKL = settings.crudeOilGJperKL > 0 ? inputGJ / settings.crudeOilGJperKL : null;
     const costYen = sumMetric(kpiCurrentRows, "elecKWh") * settings.elecPricePerKWh + sumMetric(kpiCurrentRows, "oilTotalL") * settings.oilPricePerL;
+    const totalRatedCapacityKW = (settings.chiller1CapacityKW || 0) + (settings.chiller2CapacityKW || 0) + (settings.boiler1CapacityKW || 0) + (settings.boiler2CapacityKW || 0);
+    const maxCapacityGJ = totalRatedCapacityKW * 24 * 0.0036 * periodDays;
+    const equipUtilPct = maxCapacityGJ > 0 ? loadGJ / maxCapacityGJ * 100 : null;
     return {
       inputGJ,
       loadGJ,
       ratio: inputGJ > 0 ? loadGJ / inputGJ * 100 : null,
       co2,
       crudeOilKL,
-      costYen
+      costYen,
+      equipUtilPct
     };
-  }, [kpiCurrentRows, settings]);
+  }, [kpiCurrentRows, settings, periodDays]);
+  const enthalpyStat = useMemo(() => {
+    const cur = avgMetric(kpiCurrentRows, "enthalpyKJkg");
+    const prev = kpiPreviousRows.length ? avgMetric(kpiPreviousRows, "enthalpyKJkg") : null;
+    const pct = prev != null && prev !== 0 ? (cur - prev) / prev * 100 : null;
+    return {
+      current: cur,
+      previous: prev,
+      pct
+    };
+  }, [kpiCurrentRows, kpiPreviousRows]);
   return /*#__PURE__*/React.createElement("div", {
-    className: "app-shell" + (showReportPreview ? " report-preview" : ""),
+    className: "app-shell",
     "data-theme": darkMode ? "dark" : "light"
-  }, showReportPreview && /*#__PURE__*/React.createElement("div", {
-    className: "report-preview-bar no-print"
-  }, /*#__PURE__*/React.createElement("span", null, "\uD83D\uDCC4 \u30EC\u30DD\u30FC\u30C8\u30D7\u30EC\u30D3\u30E5\u30FC\u8868\u793A\u4E2D\uFF08\u3053\u306E\u5185\u5BB9\u304C\u5370\u5237/PDF\u5316\u3055\u308C\u307E\u3059\uFF09"), /*#__PURE__*/React.createElement("div", {
-    className: "report-preview-actions"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "btn btn-primary",
-    onClick: () => window.print()
-  }, "\uD83D\uDDA8 \u5370\u5237\u3059\u308B"), /*#__PURE__*/React.createElement("button", {
-    className: "btn btn-ghost",
-    onClick: () => setShowReportPreview(false)
-  }, "\u2715 \u30D7\u30EC\u30D3\u30E5\u30FC\u3092\u9589\u3058\u308B"))), /*#__PURE__*/React.createElement("header", {
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "app-sticky-top"
+  }, /*#__PURE__*/React.createElement("header", {
     className: "app-header"
   }, /*#__PURE__*/React.createElement("div", {
     className: "app-title-row"
@@ -4551,52 +5199,31 @@ function App() {
     className: "btn btn-ghost",
     onClick: () => setShowMonitorImport(true)
   }, "\uD83D\uDDA5 \u4E2D\u592E\u76E3\u8996\u753B\u9762\u53D6\u308A\u8FBC\u307F"), /*#__PURE__*/React.createElement("button", {
-    className: "btn btn-ghost",
-    onClick: () => setShowReportPreview(true),
-    title: "\u5370\u5237/PDF\u4FDD\u5B58\u524D\u306B\u30EC\u30DD\u30FC\u30C8\u306E\u30D7\u30EC\u30D3\u30E5\u30FC\u3092\u8868\u793A\u3057\u307E\u3059"
-  }, "\u30EC\u30DD\u30FC\u30C8\u4F5C\u6210(PDF)"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-ghost header-settings-btn",
     onClick: () => setDarkMode(v => !v)
   }, darkMode ? "☀ ライト" : "🌙 ダーク"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-ghost",
     onClick: () => setShowSettings(true)
-  }, "\u8A2D\u5B9A"))), mode === "entry" && /*#__PURE__*/React.createElement(DataEntryView, {
-    data: dataDisplay,
-    onSave: handleSaveRecord,
-    onDelete: handleDeleteRecord,
-    notes: notes,
-    onSaveNote: handleSaveNote,
-    monitorFiles: monitorFiles,
-    onDeleteMonitorFile: handleDeleteMonitorFile
-  }), mode === "analysis" && (data.length ? /*#__PURE__*/React.createElement(AnalysisView, {
-    data: dataDisplay,
-    settings: settings,
-    darkMode: darkMode,
-    notes: notes,
-    onSaveNote: handleSaveNote
-  }) : /*#__PURE__*/React.createElement("div", {
-    className: "empty-state"
-  }, "\u30C7\u30FC\u30BF\u304C\u3042\u308A\u307E\u305B\u3093\u3002")), mode === "dashboard" && !data.length && /*#__PURE__*/React.createElement("div", {
-    className: "empty-state"
-  }, "\u30C7\u30FC\u30BF\u304C\u3042\u308A\u307E\u305B\u3093\u3002\u300C\u30C7\u30FC\u30BF\u5165\u529B\u300D\u307E\u305F\u306F\u300C\u30C7\u30FC\u30BF\u66F4\u65B0\u300D\u304B\u3089\u53D6\u308A\u8FBC\u3093\u3067\u304F\u3060\u3055\u3044\u3002"), mode === "dashboard" && data.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
-    className: "print-only-header"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "print-report-title"
-  }, "\u30A8\u30CD\u30EB\u30AE\u30FC\u7BA1\u7406\u30EC\u30DD\u30FC\u30C8"), /*#__PURE__*/React.createElement("div", {
-    className: "print-report-meta"
-  }, "\u5BFE\u8C61\u671F\u9593: ", kpiLabel, " \uFF0F \u51FA\u529B\u65E5\u6642: ", new Date().toLocaleString("ja-JP"))), dataGaps.length > 0 && /*#__PURE__*/React.createElement("div", {
-    className: "gap-banner"
-  }, "\u30C7\u30FC\u30BF\u6B20\u843D\u671F\u9593\u306E\u53EF\u80FD\u6027: ", dataGaps.map((g, i) => /*#__PURE__*/React.createElement("span", {
-    key: i
-  }, i > 0 && "、", g.from, " \u301C ", g.to, "\uFF08\u7D04", g.days, "\u65E5\u5206\uFF09")), "\u3002\u5143\u30C7\u30FC\u30BF\uFF08\u30A8\u30CD\u30EB\u30AE\u30FC.xlsx\uFF09\u3092\u3054\u78BA\u8A8D\u306E\u3046\u3048\u3001\u5FC5\u8981\u3067\u3042\u308C\u3070\u4FEE\u6B63\u5F8C\u306B\u300C\u30C7\u30FC\u30BF\u66F4\u65B0\u300D\u304B\u3089\u518D\u53D6\u8FBC\u307F\u3057\u3066\u304F\u3060\u3055\u3044\u3002"), showAlertBanner && /*#__PURE__*/React.createElement("div", {
-    className: "alert-banner no-print"
+  }, "\u8A2D\u5B9A"))), !showMonitorImport && showAlertBanner && /*#__PURE__*/React.createElement("div", {
+    className: "alert-banner"
   }, /*#__PURE__*/React.createElement("div", {
     className: "alert-banner-header"
   }, /*#__PURE__*/React.createElement("span", null, "\u26A0 \u76F4\u8FD17\u65E5\u3067", recentAlerts.length, "\u4EF6\u306E\u6CE8\u610F\u4E8B\u9805\u304C\u3042\u308A\u307E\u3059"), /*#__PURE__*/React.createElement("div", {
     className: "alert-banner-actions"
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn btn-small",
-    onClick: () => setMode("analysis")
+    onClick: () => {
+      const first = recentAlerts[0];
+      if (first) {
+        setAnalysisFocus({
+          type: first.type,
+          metric: first.metricKey,
+          date: first.date,
+          token: Date.now()
+        });
+      }
+      setMode("analysis");
+    }
   }, "\u5206\u6790\u3067\u8A73\u3057\u304F\u898B\u308B"), /*#__PURE__*/React.createElement("button", {
     className: "btn btn-small",
     onClick: () => setDismissedAlertSig(alertSig)
@@ -4612,7 +5239,38 @@ function App() {
       disabled: alreadyRecorded,
       onClick: () => handleSaveNote(a.date, existing ? `${existing}\n${a.message}` : a.message)
     }, alreadyRecorded ? "記録済み" : "メモに記録"));
-  }))), (() => {
+  })))), showMonitorImport ? /*#__PURE__*/React.createElement(MonitorImportModal, {
+    defaultDate: latestDate || new Date().toISOString().slice(0, 10),
+    onClose: () => setShowMonitorImport(false),
+    onUploaded: handleUploadedMonitorFile,
+    onSavedAndAnalyze: setPreviewMonitorDate,
+    monitorFiles: monitorFiles,
+    onOpenExistingPreview: setPreviewMonitorDate
+  }) : /*#__PURE__*/React.createElement(React.Fragment, null, mode === "entry" && /*#__PURE__*/React.createElement(DataEntryView, {
+    data: dataDisplay,
+    onSave: handleSaveRecord,
+    onDelete: handleDeleteRecord,
+    notes: notes,
+    onSaveNote: handleSaveNote,
+    monitorFiles: monitorFiles,
+    onDeleteMonitorFile: handleDeleteMonitorFile,
+    onOpenMonitorPreview: setPreviewMonitorDate
+  }), mode === "analysis" && (data.length ? /*#__PURE__*/React.createElement(AnalysisView, {
+    data: dataDisplay,
+    settings: settings,
+    darkMode: darkMode,
+    notes: notes,
+    onSaveNote: handleSaveNote,
+    focus: analysisFocus
+  }) : /*#__PURE__*/React.createElement("div", {
+    className: "empty-state"
+  }, "\u30C7\u30FC\u30BF\u304C\u3042\u308A\u307E\u305B\u3093\u3002")), mode === "dashboard" && !data.length && /*#__PURE__*/React.createElement("div", {
+    className: "empty-state"
+  }, "\u30C7\u30FC\u30BF\u304C\u3042\u308A\u307E\u305B\u3093\u3002\u300C\u30C7\u30FC\u30BF\u5165\u529B\u300D\u307E\u305F\u306F\u300C\u30C7\u30FC\u30BF\u66F4\u65B0\u300D\u304B\u3089\u53D6\u308A\u8FBC\u3093\u3067\u304F\u3060\u3055\u3044\u3002"), mode === "dashboard" && data.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, dataGaps.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "gap-banner"
+  }, "\u30C7\u30FC\u30BF\u6B20\u843D\u671F\u9593\u306E\u53EF\u80FD\u6027: ", dataGaps.map((g, i) => /*#__PURE__*/React.createElement("span", {
+    key: i
+  }, i > 0 && "、", g.from, " \u301C ", g.to, "\uFF08\u7D04", g.days, "\u65E5\u5206\uFF09")), "\u3002\u5143\u30C7\u30FC\u30BF\uFF08\u30A8\u30CD\u30EB\u30AE\u30FC.xlsx\uFF09\u3092\u3054\u78BA\u8A8D\u306E\u3046\u3048\u3001\u5FC5\u8981\u3067\u3042\u308C\u3070\u4FEE\u6B63\u5F8C\u306B\u300C\u30C7\u30FC\u30BF\u66F4\u65B0\u300D\u304B\u3089\u518D\u53D6\u8FBC\u307F\u3057\u3066\u304F\u3060\u3055\u3044\u3002"), (() => {
     const renderChartBody = (chart, hideTitle) => {
       const forecastMetrics = chart.selectedMetrics.filter(m => FORECASTABLE.includes(m));
       const forecastMap = buckets && chart.showForecast && view !== "year" ? computeForecastMap(dataDisplay, view, selectedYm, selectedFY, chart.forecastMethod, forecastMetrics) : {};
@@ -4888,6 +5546,21 @@ function App() {
       unit: "\u5186",
       active: !!charts[0] && charts[0].selectedMetrics.includes("costYen"),
       onClick: () => toggleMetricInFirstChart("costYen")
+    }), /*#__PURE__*/React.createElement(KPICard, {
+      label: "\u6BD4\u30A8\u30F3\u30BF\u30EB\u30D4\u30FC(\u5916\u6C17)",
+      current: enthalpyStat.current,
+      previous: enthalpyStat.previous,
+      unit: "kJ/kg",
+      pct: enthalpyStat.pct,
+      active: !!charts[0] && charts[0].selectedMetrics.includes("enthalpyKJkg"),
+      onClick: () => toggleMetricInFirstChart("enthalpyKJkg")
+    }), /*#__PURE__*/React.createElement(KPICard, {
+      label: "\u8A2D\u5099\u7A3C\u50CD\u7387(\u8CA0\u8377/\u5B9A\u683C\u80FD\u529B)",
+      current: efficiency.equipUtilPct,
+      unit: "%",
+      highlight: "\u26A0 \u5B9A\u683C\u80FD\u529B\u306F\u73FE\u5728\u4EEE\u306E\u6570\u5024\u3067\u3059\uFF08\u8A2D\u5B9A\u753B\u9762\u3067\u7DE8\u96C6\u53EF\u80FD\uFF09",
+      active: !!charts[0] && charts[0].selectedMetrics.includes("equipUtilPct"),
+      onClick: () => toggleMetricInFirstChart("equipUtilPct")
     })), charts[0] && /*#__PURE__*/React.createElement("div", {
       className: "combined-chart-wrap"
     }, renderChartBody(charts[0], true)), /*#__PURE__*/React.createElement(AiCommentBox, {
@@ -4919,7 +5592,7 @@ function App() {
       onDelete: charts.length > 1 ? () => removeChart(chart.id) : null,
       onClose: () => setOpenChartSettings(null)
     });
-  })()), showSettings && /*#__PURE__*/React.createElement(SettingsModal, {
+  })())), showSettings && /*#__PURE__*/React.createElement(SettingsModal, {
     settings: settings,
     onSave: handleSaveSettings,
     onClose: () => setShowSettings(false),
@@ -4935,12 +5608,16 @@ function App() {
   }), showDataUpdate && /*#__PURE__*/React.createElement(DataUpdateModal, {
     onImport: handleImportData,
     onClose: () => setShowDataUpdate(false)
-  }), showMonitorImport && /*#__PURE__*/React.createElement(MonitorImportModal, {
-    defaultDate: latestDate || new Date().toISOString().slice(0, 10),
-    onClose: () => setShowMonitorImport(false),
-    onUploaded: handleUploadedMonitorFile
+  }), previewMonitorDate && /*#__PURE__*/React.createElement(MonitorPreviewModal, {
+    date: previewMonitorDate,
+    files: previewMonitorFiles,
+    settings: settings,
+    onClose: () => setPreviewMonitorDate(null),
+    onDelete: handleDeleteMonitorFile
   }), /*#__PURE__*/React.createElement("style", null, `
         .app-shell { max-width: 1280px; margin: 0 auto; padding: 16px calc(20px + env(safe-area-inset-right)) calc(60px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left)); }
+        .app-sticky-top { position: sticky; top: 0; z-index: 500; background: #f1f5f9; padding-bottom: 6px; }
+        .app-shell[data-theme="dark"] .app-sticky-top { background: #0b1220; }
         .app-header { padding:14px 20px; background:#0f172a; color:#fff; border-radius:12px; margin-bottom:16px; }
         .app-title-row { margin-bottom:12px; display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
         .app-title { font-size:18px; font-weight:700; }
@@ -5061,6 +5738,8 @@ function App() {
         .anomaly-table th, .anomaly-table td { padding:6px 10px; border-bottom:1px solid #f1f5f9; text-align:right; }
         .anomaly-table th:first-child, .anomaly-table td:first-child { text-align:left; }
         .anomaly-table th { color:#94a3b8; font-weight:700; background:#f8fafc; }
+        .anomaly-table tr.row-focused td { background:#fef2f2; }
+        .app-shell[data-theme="dark"] .anomaly-table tr.row-focused td { background:#3f1d1d; }
         .dev-up { color:#dc2626; font-weight:700; }
         .dev-down { color:#2563eb; font-weight:700; }
         .target-row { margin-bottom:14px; }
@@ -5105,16 +5784,57 @@ function App() {
         .monitor-preview-body { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; overflow:auto; background:#f1f5f9; border-radius:8px; margin-top:14px; }
         .monitor-preview-frame { width:100%; height:min(75vh, 900px); border:none; border-radius:8px; }
         .monitor-preview-image { max-width:100%; max-height:75vh; object-fit:contain; }
-        .monitor-selected-list { list-style:none; margin:6px 0 0; padding:0; font-size:13px; }
-        .monitor-selected-list li { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #f1f5f9; }
-        .monitor-selected-status { color:#64748b; font-size:12px; }
+        .monitor-preview-list { display:flex; flex-wrap:wrap; gap:12px; margin-top:10px; }
+        .monitor-preview-item { width:140px; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden; }
+        .monitor-preview-item-thumb { width:100%; height:100px; background:#f1f5f9; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+        .monitor-preview-item-thumb img { width:100%; height:100%; object-fit:contain; }
+        .monitor-preview-item-pdf { width:100%; height:100%; border:none; }
+        .monitor-preview-item-loading, .monitor-preview-item-error { font-size:12px; color:#64748b; }
+        .monitor-preview-item-error { color:#b91c1c; font-size:20px; }
+        .monitor-preview-item-info { padding:6px 8px; font-size:12px; }
+        .monitor-preview-item-name { word-break:break-all; margin-bottom:2px; }
+        .monitor-selected-status { color:#64748b; font-size:12px; display:block; }
         .monitor-selected-status.error { color:#b91c1c; }
         .monitor-file-card { border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-top:14px; }
         .monitor-file-card-header { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:4px; }
+        .monitor-file-card-actions { display:flex; gap:8px; flex-shrink:0; }
+        .monitor-preview-item-clickable { cursor:pointer; transition:box-shadow 0.15s, border-color 0.15s; }
+        .monitor-preview-item-clickable:hover { border-color:#2563eb; box-shadow:0 0 0 2px rgba(37,99,235,0.15); }
+        .monitor-preview-list-large .monitor-preview-item { width:min(320px, 100%); }
+        .monitor-preview-list-large .monitor-preview-item-thumb { height:280px; }
+        .monitor-import-panel { background:#fff; border-radius:12px; padding:20px 24px; margin-bottom:16px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+        .app-shell[data-theme="dark"] .monitor-import-panel { background:#1e293b; }
         .monitor-summary-box { padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; margin-bottom:4px; }
         .app-shell[data-theme="dark"] .monitor-file-card { border-color:#334155; }
         .app-shell[data-theme="dark"] .monitor-summary-box { background:#1e293b; border-color:#334155; }
-        .app-shell[data-theme="dark"] .monitor-selected-list li { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-preview-item { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-preview-item-thumb { background:#1e293b; }
+        .monitor-import-cal { margin:10px 0; border:1px solid #e2e8f0; border-radius:10px; padding:8px 10px; width:240px; max-width:100%; }
+        .monitor-import-cal-header { display:flex; align-items:center; justify-content:space-between; font-size:12px; font-weight:700; margin-bottom:4px; gap:4px; }
+        .monitor-import-cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:1px; }
+        .monitor-import-cal-dow { font-size:10px; color:#94a3b8; text-align:center; margin-bottom:2px; }
+        .monitor-import-cal-cell {
+          position:relative; height:26px; border:1px solid transparent; border-radius:5px; background:none;
+          font-size:11px; cursor:pointer; color:#334155;
+        }
+        .monitor-import-cal-cell:hover { background:#f1f5f9; }
+        .monitor-import-cal-cell.selected { background:#2563eb; color:#fff; font-weight:700; }
+        .monitor-import-cal-cell.empty { cursor:default; }
+        .monitor-import-cal-dot { position:absolute; bottom:0; right:1px; font-size:7px; line-height:1; }
+        .monitor-import-existing { margin:10px 0; }
+        .monitor-import-saved-list { margin:10px 0; }
+        .monitor-import-saved-list-title { font-size:13px; font-weight:700; margin-bottom:6px; }
+        .monitor-import-saved-list-items { display:flex; flex-wrap:wrap; gap:6px; max-height:120px; overflow-y:auto; }
+        .monitor-import-saved-list-item { border:1px solid #cbd5e1; background:#fff; border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; color:#334155; }
+        .monitor-import-saved-list-item:hover { background:#f1f5f9; }
+        .monitor-import-saved-list-item.selected { background:#2563eb; border-color:#2563eb; color:#fff; }
+        .monitor-import-preview-step { margin-top:10px; padding-top:10px; border-top:1px solid #e2e8f0; }
+        .app-shell[data-theme="dark"] .monitor-import-cal { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-import-cal-cell { color:#e2e8f0; }
+        .app-shell[data-theme="dark"] .monitor-import-cal-cell:hover { background:#1e293b; }
+        .app-shell[data-theme="dark"] .monitor-import-saved-list-item { background:#1e293b; border-color:#334155; color:#e2e8f0; }
+        .app-shell[data-theme="dark"] .monitor-import-saved-list-item:hover { background:#0f172a; }
+        .app-shell[data-theme="dark"] .monitor-import-preview-step { border-color:#334155; }
         .monitor-dropzone {
           border:2px dashed #cbd5e1; border-radius:10px; padding:24px 16px; text-align:center;
           font-size:13px; color:#64748b; cursor:pointer; margin:10px 0; transition:background 0.15s, border-color 0.15s;
@@ -5222,46 +5942,6 @@ function App() {
         .app-shell[data-theme="dark"] .gap-banner { background:#3f2d0d; border-color:#92400e; color:#fde68a; }
         .app-shell[data-theme="dark"] .modal-note { color:#94a3b8; }
 
-        .print-only-header { display:none; }
-        .print-report-title { font-size:20px; font-weight:700; }
-        .print-report-meta { font-size:12px; color:#475569; margin-top:4px; }
-
-        .report-preview-bar {
-          position:sticky; top:0; z-index:500; display:flex; align-items:center; justify-content:space-between;
-          gap:12px; background:#0f172a; color:#fff; padding:10px 16px; border-radius:10px; margin-bottom:16px;
-        }
-        .report-preview-bar span { font-size:13px; }
-        .report-preview-actions { display:flex; gap:8px; }
-
-        /* 画面上でのレポートプレビュー表示（実際の印刷用CSSと同じ内容を画面にも適用） */
-        .app-shell.report-preview .no-print:not(.report-preview-bar),
-        .app-shell.report-preview .app-header-row2, .app-shell.report-preview .tabs,
-        .app-shell.report-preview .gear-btn, .app-shell.report-preview .chart-header-toggle,
-        .app-shell.report-preview .chart-header-select, .app-shell.report-preview .add-chart-btn,
-        .app-shell.report-preview .mode-toggle, .app-shell.report-preview .entry-list-panel,
-        .app-shell.report-preview .day-type-legend, .app-shell.report-preview .chart-canvas-toolbar,
-        .app-shell.report-preview .alert-banner-actions, .app-shell.report-preview .kpi-period-header
-          { display:none !important; }
-        .app-shell.report-preview { background:#fff; }
-        .app-shell.report-preview .app-header { background:#fff; color:#0f172a; box-shadow:none; padding:0 0 8px; }
-        .app-shell.report-preview .print-only-header { display:block; margin-bottom:14px; border-bottom:2px solid #0f172a; padding-bottom:10px; }
-        .app-shell.report-preview .chart-panel, .app-shell.report-preview .kpi-row,
-        .app-shell.report-preview .combined-chart-wrap, .app-shell.report-preview .chart-side-selector
-          { box-shadow:none !important; border:1px solid #cbd5e1; }
-
-        @media print {
-          .no-print, .app-header-row2, .tabs, .gear-btn, .chart-header-toggle, .chart-header-select,
-          .add-chart-btn, .mode-toggle, .entry-list-panel, .day-type-legend, .chart-canvas-toolbar,
-          .alert-banner-actions, .kpi-period-header { display:none !important; }
-          body { background:#fff; }
-          .app-shell { padding:0; max-width:100%; }
-          .app-header { background:#fff; color:#0f172a; border-radius:0; box-shadow:none; padding:0 0 8px; }
-          .print-only-header { display:block; margin-bottom:14px; border-bottom:2px solid #0f172a; padding-bottom:10px; }
-          .gap-banner, .alert-banner { break-inside:avoid; page-break-inside:avoid; }
-          .chart-panel, .kpi-row, .combined-chart-wrap, .chart-side-selector { box-shadow:none !important; border:1px solid #cbd5e1; break-inside:avoid; page-break-inside:avoid; }
-          .kpi-card { break-inside:avoid; }
-          .chart-canvas-wrap { height:260px !important; }
-        }
       `));
 }
 function AuthGate() {

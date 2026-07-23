@@ -18,13 +18,17 @@ const METRICS = {
   totalLoadGJ:       { label: "負荷熱量(合計)",         unit: "GJ",  color: "#7c3aed", kind: "sum", group: "熱負荷", derived: true },
   tempAvg:           { label: "外気温度(平均)",         unit: "℃",   color: "#16a34a", kind: "avg", group: "気象" },
   humidityAvg:       { label: "外気湿度(平均)",         unit: "%RH", color: "#4b5563", kind: "avg", group: "気象" },
+  enthalpyKJkg:      { label: "比エンタルピー(外気)",     unit: "kJ/kg", color: "#0ea5e9", kind: "avg", group: "気象", derived: true },
   efficiencyPct:     { label: "総合熱源効率",           unit: "%",   color: "#0d9488", kind: "avg", group: "コスト・環境", derived: true },
   co2T:              { label: "CO2排出量",              unit: "t-CO2", color: "#0f766e", kind: "sum", group: "コスト・環境", derived: true },
   crudeOilKL:        { label: "原油換算値",             unit: "kL",  color: "#92400e", kind: "sum", group: "コスト・環境", derived: true },
   costYen:           { label: "概算コスト",              unit: "円",  color: "#ca8a04", kind: "sum", group: "コスト・環境", derived: true },
+  equipUtilPct:      { label: "設備稼働率(負荷/定格能力)", unit: "%",   color: "#65a30d", kind: "avg", group: "コスト・環境", derived: true },
 };
 const METRIC_GROUPS = ["電力", "重油", "熱負荷", "気象", "コスト・環境"];
 const FORECASTABLE = ["elecKWh", "oilTotalL", "oilChillerTotalL", "oilBoilerTotalL", "coolLoadGJ", "heatLoadGJ", "totalLoadGJ", "co2T", "crudeOilKL", "costYen"];
+// ダッシュボードのKPIカードと同じ項目（分析ビューの日付比較で比較対象にする）
+const DASHBOARD_KPI_KEYS = ["elecKWh", "oilTotalL", "coolLoadGJ", "heatLoadGJ", "demandKW", "efficiencyPct", "co2T", "crudeOilKL", "costYen", "enthalpyKJkg", "equipUtilPct"];
 const CHART_TYPE_OPTIONS = [["line", "折れ線"], ["bar", "棒"], ["stackedBar", "積み上げ棒"], ["scatter", "散布図(気温相関)"]];
 
 const FM_LABELS = ["4月","5月","6月","7月","8月","9月","10月","11月","12月","1月","2月","3月"];
@@ -44,6 +48,12 @@ const DEFAULT_SETTINGS = {
   demandAlertPct: 100,
   elecPricePerKWh: 30,
   oilPricePerL: 100,
+  // 熱源機器の定格能力(kW)。現時点では架空の仮数値。竣工図・機器リストの実際の値に
+  // 置き換えること（設定画面「熱源機器の定格能力」から編集可能）。
+  chiller1CapacityKW: 500,
+  chiller2CapacityKW: 500,
+  boiler1CapacityKW: 300,
+  boiler2CapacityKW: 300,
 };
 
 const LS_DATA_KEY = "energyApp.data.v1";
@@ -135,13 +145,113 @@ async function fetchGeminiImageComment(prompt, dataUrl, mimeType) {
   return data.comment || "(コメントを取得できませんでした)";
 }
 
+// 複数枚の画像/PDFを1回のGemini呼び出しでまとめて渡す（カメラで複数の監視画面を撮影し、
+// 画面をまたいだ機器をまとめて分析したい場合など）。images = [{ dataUrl, mimeType }, ...]。
+// Apps Script側（doPost）がbody.imagesの配列を読み取れるよう対応している必要がある。
+async function fetchGeminiMultiImageComment(prompt, images) {
+  if (!GEMINI_PROXY_URL || GEMINI_PROXY_URL === "YOUR_APPS_SCRIPT_WEB_APP_URL") {
+    throw new Error("Apps ScriptのURLが未設定です（app.jsx内のGEMINI_PROXY_URLを設定してください）。");
+  }
+  const imagesPayload = images.map(({ dataUrl, mimeType }) => ({
+    data: dataUrl.slice(dataUrl.indexOf(",") + 1),
+    mimeType: mimeType || "image/jpeg",
+  }));
+  const res = await fetch(GEMINI_PROXY_URL, {
+    method: "POST",
+    body: JSON.stringify({ prompt, images: imagesPayload }),
+  });
+  if (!res.ok) throw new Error(`通信エラー（${res.status}）`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.comment || "(コメントを取得できませんでした)";
+}
+
 // 中央監視画面1枚を単体で分析させるプロンプト。
 function buildMonitorImagePrompt(dateStr, fileName) {
   return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}の中央監視装置の画面（${fileName}）です。表示されている数値・稼働状態・警報表示などを読み取り、注意すべき点や異常の兆候があれば日本語で150字程度で指摘してください。画像/文書から内容が読み取れない場合はその旨を述べてください。`;
 }
+// 機器ごとの読み取り結果をアプリ側で表として描画できるよう、回答の最後の1行にだけ
+// 機械可読なJSON配列を出力させる共通の指示文（parseLoadTableで抜き出す）。
+const LOAD_TABLE_OUTPUT_INSTRUCTION =
+  `アドバイス本文には太字記号(**)や見出し記号(#)、罫線(---)などの装飾は使わず、プレーンな` +
+  `日本語の文章だけにしてください。そのうえで、回答の最後の行にだけ、各機器の読み取り結果を` +
+  `次のJSON形式で出力してください（説明文を混ぜないこと）：\n` +
+  `LOAD_TABLE: [{"name":"機器名","outputKW":数値またはnull,"capacityKW":数値,"loadPct":数値またはnull}, ...]`;
+
+// Geminiの回答から末尾のLOAD_TABLE:行を取り出し、本文コメント（装飾記号は念のため除去）と
+// 機器ごとの表データに分離する。
+function parseLoadTable(rawText) {
+  const m = rawText.match(/LOAD_TABLE:\s*(\[[\s\S]*?\])\s*$/i);
+  if (!m) return { comment: stripMarkdownDecoration(rawText), table: null };
+  let table = null;
+  try { table = JSON.parse(m[1]); } catch (e) { table = null; }
+  return { comment: stripMarkdownDecoration(rawText.slice(0, m.index).trim()), table };
+}
+function stripMarkdownDecoration(text) {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/^-{3,}\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// 中央監視画面に表示された各機器の「瞬間出力」を読み取り、定格能力（設定画面で入力済み）と
+// 突き合わせて、今この瞬間の運転をより効率的にする組み合わせ・負荷配分のアドバイスを求める。
+function buildOptimalOperationPrompt(dateStr, fileName, settings) {
+  const capacityLines = [
+    `冷温水発生器No.1: 定格 ${settings.chiller1CapacityKW || 0} kW`,
+    `冷温水発生器No.2: 定格 ${settings.chiller2CapacityKW || 0} kW`,
+    `ボイラーNo.1: 定格 ${settings.boiler1CapacityKW || 0} kW`,
+    `ボイラーNo.2: 定格 ${settings.boiler2CapacityKW || 0} kW`,
+  ].join("\n");
+  return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}に撮影した中央監視装置の画面（${fileName}）で、各熱源機器の現在の瞬間出力（kW等）が表示されています。\n\n` +
+    `各機器の定格能力は次の通りです：\n${capacityLines}\n\n` +
+    `画面から各機器の現在の出力を読み取り、定格能力に対する負荷率(%)を機器ごとに算出してください。` +
+    `熱源機器は一般に、定格に対して極端に低い負荷（部分負荷）で運転すると効率が下がる傾向があります。` +
+    `現在の稼働状況（どの機器が動いていて、どのくらいの負荷率か）を踏まえ、機器の組み合わせや負荷配分を` +
+    `見直すことでより効率的な運転にできないか、日本語で300字程度のアドバイスを述べてください。` +
+    `画面から数値が読み取れない場合は、その旨と読み取れた範囲の情報を述べてください。\n\n` +
+    LOAD_TABLE_OUTPUT_INSTRUCTION;
+}
+// buildOptimalOperationPromptの複数画像版。監視画面が1枚に収まらず複数枚に分けて撮影した
+// 場合など、全画像をまとめて1回のGemini呼び出しで見比べながらアドバイスさせたいときに使う。
+function buildOptimalOperationMultiPrompt(dateStr, fileNames, settings) {
+  const capacityLines = [
+    `冷温水発生器No.1: 定格 ${settings.chiller1CapacityKW || 0} kW`,
+    `冷温水発生器No.2: 定格 ${settings.chiller2CapacityKW || 0} kW`,
+    `ボイラーNo.1: 定格 ${settings.boiler1CapacityKW || 0} kW`,
+    `ボイラーNo.2: 定格 ${settings.boiler2CapacityKW || 0} kW`,
+  ].join("\n");
+  return `あなたは工場設備のエネルギー管理の専門家です。添付は${dateStr}に撮影した中央監視装置の画面${fileNames.length}枚（${fileNames.join("、")}）です。監視画面が1台では収まらず複数枚に分けて撮影されている場合があり、各熱源機器の現在の瞬間出力（kW等）がいずれかの画像に表示されています。\n\n` +
+    `各機器の定格能力は次の通りです：\n${capacityLines}\n\n` +
+    `すべての画像を確認し、各機器の現在の出力を読み取って、定格能力に対する負荷率(%)を機器ごとに算出してください。` +
+    `熱源機器は一般に、定格に対して極端に低い負荷（部分負荷）で運転すると効率が下がる傾向があります。` +
+    `画像全体を通して見た現在の稼働状況（どの機器が動いていて、どのくらいの負荷率か）を踏まえ、機器の組み合わせや` +
+    `負荷配分を見直すことでより効率的な運転にできないか、日本語で300字程度のアドバイスを述べてください。` +
+    `一部の画像から数値が読み取れない場合は、その旨と読み取れた範囲の情報を述べてください。\n\n` +
+    LOAD_TABLE_OUTPUT_INSTRUCTION;
+}
 // 複数画面それぞれの個別分析結果を踏まえて、その日全体としての総括をさせるプロンプト（テキストのみ）。
 function buildMonitorSummaryPrompt(dateStr, perFileComments) {
   return `あなたは工場設備のエネルギー管理の専門家です。以下は${dateStr}に取り込まれた中央監視装置の複数の画面について、それぞれ個別に分析した結果です。\n\n${perFileComments.join("\n")}\n\nこれらを踏まえて、その日の設備全体としての状態を200字程度の日本語でまとめてください。画面間で関連する異常や矛盾があれば特に指摘してください。`;
+}
+
+// 竣工図・機器リストのPDF/画像から、熱源機器4台の定格能力(kW)を読み取らせるプロンプト。
+// 回答の最後の1行だけに機械可読なJSON形式で出力させ、parseExtractedCapacityで抜き出す。
+function buildEquipCapacityExtractionPrompt() {
+  return `あなたは設備台帳の読み取りアシスタントです。添付は熱源機器の竣工図または機器リストです。` +
+    `次の4つの機器について、記載されている定格能力(kW)を読み取ってください。` +
+    `冷凍能力がUSRt(米国冷凍トン、1USRt≈3.517kW)やkcal/h(1kcal/h≈1.163W)などkW以外の単位で` +
+    `書かれている場合はkWに換算してください。読み取れない機器はnullにしてください。\n` +
+    `1. 冷温水発生器No.1\n2. 冷温水発生器No.2\n3. ボイラーNo.1\n4. ボイラーNo.2\n\n` +
+    `回答は他の説明文を含めず、最後の行にだけ次のJSON形式で出力してください：\n` +
+    `EXTRACTED_CAPACITY: {"chiller1": 数値またはnull, "chiller2": 数値またはnull, "boiler1": 数値またはnull, "boiler2": 数値またはnull}`;
+}
+function parseExtractedCapacity(rawText) {
+  const m = rawText.match(/EXTRACTED_CAPACITY:\s*(\{[\s\S]*?\})/i);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch (e) { return null; }
 }
 
 function buildAnalysisPrompt(title, dataText, extraInstruction) {
@@ -212,10 +322,22 @@ function fbReplaceAll(rows, settingsObj, notesObj) {
 // ============================================================
 // ユーティリティ
 // ============================================================
+// 外気温度・湿度から比エンタルピー（乾き空気1kgあたりの熱量, kJ/kg(DA)）を計算する。
+// 飽和水蒸気圧はTetens近似式、大気圧は標準大気圧(1013.25hPa)を前提とする。
+function calcSpecificEnthalpy(tempC, rhPct) {
+  if (tempC == null || rhPct == null || isNaN(tempC) || isNaN(rhPct)) return null;
+  const satPressureHpa = 6.1078 * Math.pow(10, (7.5 * tempC) / (tempC + 237.3));
+  const vaporPressureHpa = (rhPct / 100) * satPressureHpa;
+  const atmPressureHpa = 1013.25;
+  const humidityRatio = (0.622 * vaporPressureHpa) / (atmPressureHpa - vaporPressureHpa);
+  return 1.006 * tempC + humidityRatio * (2501 + 1.805 * tempC);
+}
+
 function withDerived(row) {
   const totalLoadGJ = (row.coolLoadGJ || 0) + (row.heatLoadGJ || 0);
   const demandKW = (row.elecKWh || 0) / 24;
-  return { ...row, totalLoadGJ, demandKW };
+  const enthalpyKJkg = calcSpecificEnthalpy(row.tempAvg, row.humidityAvg);
+  return { ...row, totalLoadGJ, demandKW, enthalpyKJkg };
 }
 
 // 設定（換算係数・単価）に依存する項目は、設定変更時に再計算されるよう別関数として分離
@@ -227,7 +349,13 @@ function withComputed(row, settings) {
   const crudeOilKL = settings.crudeOilGJperKL > 0 ? inputGJ / settings.crudeOilGJperKL : null;
   const costYen = (row.elecKWh || 0) * settings.elecPricePerKWh + (row.oilTotalL || 0) * settings.oilPricePerL;
   const efficiencyPct = inputGJ > 0 ? ((row.totalLoadGJ || 0) / inputGJ) * 100 : null;
-  return { ...row, co2T, crudeOilKL, costYen, efficiencyPct };
+  // 設備稼働率＝その日の負荷熱量 ÷ 熱源機器の定格能力から算出できる1日あたりの理論上限熱量。
+  // 定格能力(kW)は現時点で竣工図・機器リストの実際の値が未入力の場合、設定画面の仮数値が使われる。
+  const totalRatedCapacityKW = (settings.chiller1CapacityKW || 0) + (settings.chiller2CapacityKW || 0)
+    + (settings.boiler1CapacityKW || 0) + (settings.boiler2CapacityKW || 0);
+  const dailyMaxCapacityGJ = totalRatedCapacityKW * 24 * 0.0036; // kW→GJ/日 (1kWh=0.0036GJ)
+  const equipUtilPct = dailyMaxCapacityGJ > 0 ? ((row.totalLoadGJ || 0) / dailyMaxCapacityGJ) * 100 : null;
+  return { ...row, co2T, crudeOilKL, costYen, efficiencyPct, equipUtilPct };
 }
 
 // ============================================================
@@ -516,6 +644,17 @@ function addDays(dateStr, delta) {
   const d = parseISO(dateStr);
   d.setDate(d.getDate() + delta);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+// 月単位で日付をずらす（前月・前年比較用）。ずらした先の月に同じ日が無い場合
+// （例：3/31の前月=2/31）は、その月の末日にクランプする。
+function addMonthsClamped(dateStr, monthsDelta) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const totalMonths = (y * 12 + (m - 1)) + monthsDelta;
+  const targetYear = Math.floor(totalMonths / 12);
+  const targetMonth = totalMonths % 12; // 0-based
+  const ym = `${targetYear}-${String(targetMonth + 1).padStart(2, "0")}`;
+  const targetDay = Math.min(d, daysInMonth(ym));
+  return `${ym}-${String(targetDay).padStart(2, "0")}`;
 }
 function classifyDay(dateStr, holidayMap) {
   if (holidayMap[dateStr]) return "holiday";
@@ -1003,6 +1142,45 @@ function SettingsModal({
 }) {
   const [form, setForm] = useState(settings);
   const [backupStatus, setBackupStatus] = useState("");
+  const [extractStatus, setExtractStatus] = useState("idle"); // idle | loading | done | error
+  const [extractMessage, setExtractMessage] = useState("");
+  const equipFileRef = useRef(null);
+
+  const handleExtractEquipFile = async (file) => {
+    if (!file) return;
+    if (!MONITOR_FILE_TYPES.includes(file.type)) {
+      setExtractStatus("error");
+      setExtractMessage("PDF・JPEG・PNGのみ読み込めます。");
+      return;
+    }
+    setExtractStatus("loading");
+    setExtractMessage("");
+    try {
+      const processed = await compressImageFile(file, MONITOR_IMAGE_MAX_DIM, MONITOR_IMAGE_QUALITY);
+      if (processed.size > MONITOR_FILE_MAX_BYTES) {
+        throw new Error(`ファイルサイズが大きすぎます（${MONITOR_FILE_MAX_BYTES / 1024 / 1024}MB以下にしてください）。`);
+      }
+      const dataUrl = await fileToDataUrl(processed);
+      const rawText = await fetchGeminiImageComment(buildEquipCapacityExtractionPrompt(), dataUrl, processed.type);
+      const extracted = parseExtractedCapacity(rawText);
+      if (!extracted) throw new Error("読み取り結果を解析できませんでした。お手数ですが手入力してください。");
+      const fieldMap = { chiller1: "chiller1CapacityKW", chiller2: "chiller2CapacityKW", boiler1: "boiler1CapacityKW", boiler2: "boiler2CapacityKW" };
+      const updates = {};
+      let foundCount = 0;
+      Object.entries(fieldMap).forEach(([extKey, formKey]) => {
+        const v = extracted[extKey];
+        if (v != null && !isNaN(v)) { updates[formKey] = Number(v); foundCount += 1; }
+      });
+      if (foundCount === 0) throw new Error("機器の定格能力を読み取れませんでした。お手数ですが手入力してください。");
+      setForm((prev) => ({ ...prev, ...updates }));
+      setExtractStatus("done");
+      setExtractMessage(`${foundCount}件の項目を読み取りました。内容を確認し、問題なければ「保存」を押してください。`);
+    } catch (e) {
+      setExtractStatus("error");
+      setExtractMessage(e.message);
+    }
+  };
+
   const handleImportFile = (file) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -1074,6 +1252,38 @@ function SettingsModal({
           <input type="number" step="1" value={form.oilPricePerL} onChange={(e) => setForm({ ...form, oilPricePerL: Number(e.target.value) })} />
         </div>
         <p className="modal-note">概算コストの計算に使用します。実際の契約単価に合わせて編集してください（目安値です）。</p>
+
+        <div className="control-title">熱源機器の定格能力 (kW)</div>
+        <p className="modal-note">⚠ 現在は仮の数値が入っています。竣工図・機器リストに記載の実際の定格能力に置き換えてください。ダッシュボードの「設備稼働率」の計算に使用します。</p>
+        <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
+          <button className="btn" onClick={() => equipFileRef.current && equipFileRef.current.click()} disabled={extractStatus === "loading"}>
+            {extractStatus === "loading" ? "🤖 読み取り中…" : "📄 機器表(PDF/画像)から自動入力"}
+          </button>
+          <input
+            type="file"
+            ref={equipFileRef}
+            accept={MONITOR_FILE_ACCEPT}
+            style={{ display: "none" }}
+            onChange={(e) => { handleExtractEquipFile(e.target.files[0]); e.target.value = ""; }}
+          />
+        </div>
+        {extractMessage && <div className="modal-status">{extractMessage}</div>}
+        <div className="form-row">
+          <label>冷温水発生器No.1</label>
+          <input type="number" value={form.chiller1CapacityKW} onChange={(e) => setForm({ ...form, chiller1CapacityKW: Number(e.target.value) })} />
+        </div>
+        <div className="form-row">
+          <label>冷温水発生器No.2</label>
+          <input type="number" value={form.chiller2CapacityKW} onChange={(e) => setForm({ ...form, chiller2CapacityKW: Number(e.target.value) })} />
+        </div>
+        <div className="form-row">
+          <label>ボイラーNo.1</label>
+          <input type="number" value={form.boiler1CapacityKW} onChange={(e) => setForm({ ...form, boiler1CapacityKW: Number(e.target.value) })} />
+        </div>
+        <div className="form-row">
+          <label>ボイラーNo.2</label>
+          <input type="number" value={form.boiler2CapacityKW} onChange={(e) => setForm({ ...form, boiler2CapacityKW: Number(e.target.value) })} />
+        </div>
 
         <div className="settings-backup-section">
           <div className="control-title">データのバックアップ/復元</div>
@@ -1303,7 +1513,7 @@ function DayEntryForm({ date, record, previousDate, previousRecord, weekAgoRecor
               {previousRecord && previousRecord[fld.key] != null ? `${fmtNum(previousRecord[fld.key], fld.digits)} ${fld.unit}` : "-"}
             </span>
             <span className="entry-form-input-wrap">
-              <input type="number" step={fld.step} value={form[fld.key]} onChange={(e) => handleChange(fld.key, e.target.value)} onKeyDown={handleInputKeyDown} />
+              <input type="number" inputMode="decimal" step={fld.step} value={form[fld.key]} onChange={(e) => handleChange(fld.key, e.target.value)} onKeyDown={handleInputKeyDown} />
               <span className="entry-form-unit">{fld.unit}</span>
             </span>
           </label>
@@ -1346,7 +1556,7 @@ function DayEntryForm({ date, record, previousDate, previousRecord, weekAgoRecor
   );
 }
 
-function DataEntryView({ data, onSave, onDelete, notes, onSaveNote, monitorFiles, onDeleteMonitorFile }) {
+function DataEntryView({ data, onSave, onDelete, notes, onSaveNote, monitorFiles, onDeleteMonitorFile, onOpenMonitorPreview }) {
   const dataByDate = useMemo(() => {
     const m = {};
     data.forEach((r) => { m[r.date] = r; });
@@ -1361,13 +1571,8 @@ function DataEntryView({ data, onSave, onDelete, notes, onSaveNote, monitorFiles
   const [showNotesList, setShowNotesList] = useState(false);
   const [showMissingDays, setShowMissingDays] = useState(false);
   const [showMonitorList, setShowMonitorList] = useState(false);
-  const [previewMonitorDate, setPreviewMonitorDate] = useState(null);
 
   const monitorDateSet = useMemo(() => new Set(monitorFiles.map((f) => f.date)), [monitorFiles]);
-  const previewMonitorFiles = useMemo(
-    () => (previewMonitorDate ? monitorFiles.filter((f) => f.date === previewMonitorDate) : []),
-    [monitorFiles, previewMonitorDate]
-  );
   const handleDeleteMonitorFile = (dateStr, fileId) => {
     onDeleteMonitorFile(dateStr, fileId);
   };
@@ -1451,7 +1656,7 @@ function DataEntryView({ data, onSave, onDelete, notes, onSaveNote, monitorFiles
                   <span
                     className="entry-cal-monitor-icon"
                     title="中央監視画面あり（クリックでプレビュー）"
-                    onClick={(e) => { e.stopPropagation(); setPreviewMonitorDate(dateStr); }}
+                    onClick={(e) => { e.stopPropagation(); onOpenMonitorPreview(dateStr); }}
                   >🖥</span>
                 )}
                 {hasNote && <span className="entry-cal-note-icon" title={notes[dateStr]}>📝</span>}
@@ -1548,15 +1753,7 @@ function DataEntryView({ data, onSave, onDelete, notes, onSaveNote, monitorFiles
         <MonitorFilesListModal
           files={monitorFiles}
           onClose={() => setShowMonitorList(false)}
-          onPreview={(dateStr) => setPreviewMonitorDate(dateStr)}
-          onDelete={handleDeleteMonitorFile}
-        />
-      )}
-      {previewMonitorDate && (
-        <MonitorPreviewModal
-          date={previewMonitorDate}
-          files={previewMonitorFiles}
-          onClose={() => setPreviewMonitorDate(null)}
+          onPreview={onOpenMonitorPreview}
           onDelete={handleDeleteMonitorFile}
         />
       )}
@@ -1618,14 +1815,59 @@ function NotesListModal({ notes, onClose, onJumpToDate }) {
 const MONITOR_FILE_ACCEPT = ".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png";
 const MONITOR_FILE_TYPES = ["application/pdf", "image/jpeg", "image/jpg", "image/png"];
 
-function MonitorImportModal({ onClose, defaultDate, onUploaded }) {
+function MonitorImportModal({ onClose, defaultDate, onUploaded, onSavedAndAnalyze, monitorFiles, onOpenExistingPreview }) {
   const [date, setDate] = useState(defaultDate);
+  const [calMonth, setCalMonth] = useState(defaultDate.slice(0, 7));
   const [status, setStatus] = useState("");
-  const [selectedFiles, setSelectedFiles] = useState([]); // [{tempId, file, status: compressing|ready|error, errorMsg}]
+  const [selectedFiles, setSelectedFiles] = useState([]); // [{tempId, file, status: compressing|ready|error, errorMsg, previewUrl}]
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [existingPreviews, setExistingPreviews] = useState({}); // fileId -> { url, revoke }
   const fileRef = useRef(null);
   const cameraRef = useRef(null);
+
+  const monitorDateSet = useMemo(() => new Set(monitorFiles.map((f) => f.date)), [monitorFiles]);
+  const existingFilesForDate = useMemo(() => monitorFiles.filter((f) => f.date === date), [monitorFiles, date]);
+  // カレンダーの下に表示する「画面を保存した日」一覧（新しい日付順）
+  const savedDatesList = useMemo(() => {
+    const counts = {};
+    monitorFiles.forEach((f) => { counts[f.date] = (counts[f.date] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => (a[0] < b[0] ? 1 : -1)).map(([d, count]) => ({ date: d, count }));
+  }, [monitorFiles]);
+
+  const pickDate = (d) => {
+    setDate(d);
+    setCalMonth(d.slice(0, 7));
+  };
+  const shiftCalMonth = (delta) => {
+    setCalMonth((prev) => {
+      const [y, m] = prev.split("-").map(Number);
+      const d = new Date(y, m - 1 + delta, 1);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    });
+  };
+  const calDim = daysInMonth(calMonth);
+  const [calY, calM] = calMonth.split("-").map(Number);
+  const calFirstDow = new Date(calY, calM - 1, 1).getDay();
+  const calCells = [];
+  for (let i = 0; i < calFirstDow; i++) calCells.push(null);
+  for (let d = 1; d <= calDim; d++) calCells.push(`${calMonth}-${String(d).padStart(2, "0")}`);
+
+  // 選択中の日付にすでに登録済みのファイルがあれば、サムネイルを読み込んで表示する。
+  useEffect(() => {
+    let cancelled = false;
+    const revokeUrls = [];
+    setExistingPreviews({});
+    existingFilesForDate.forEach((f) => {
+      monitorGetPreviewSrc(date, f.fileId).then((result) => {
+        if (cancelled || !result) return;
+        if (result.revoke) revokeUrls.push(result.url);
+        setExistingPreviews((prev) => ({ ...prev, [f.fileId]: result.url }));
+      }).catch(() => {});
+    });
+    return () => { cancelled = true; revokeUrls.forEach((u) => URL.revokeObjectURL(u)); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, existingFilesForDate.map((f) => f.fileId).join(",")]);
 
   const acceptFiles = (fileList) => {
     const files = Array.from(fileList || []);
@@ -1635,25 +1877,33 @@ function MonitorImportModal({ onClose, defaultDate, onUploaded }) {
         return;
       }
       const tempId = genMonitorFileId();
-      setSelectedFiles((prev) => [...prev, { tempId, file, status: "compressing" }]);
+      setSelectedFiles((prev) => [...prev, { tempId, file, status: "compressing", previewUrl: null }]);
       try {
         const processed = await compressImageFile(file, MONITOR_IMAGE_MAX_DIM, MONITOR_IMAGE_QUALITY);
         if (processed.size > MONITOR_FILE_MAX_BYTES) {
           setSelectedFiles((prev) => prev.map((f) => (f.tempId === tempId ? { ...f, status: "error", errorMsg: "圧縮後もサイズが大きすぎます" } : f)));
           return;
         }
-        setSelectedFiles((prev) => prev.map((f) => (f.tempId === tempId ? { ...f, file: processed, status: "ready" } : f)));
+        const previewUrl = URL.createObjectURL(processed);
+        setSelectedFiles((prev) => prev.map((f) => (f.tempId === tempId ? { ...f, file: processed, status: "ready", previewUrl } : f)));
       } catch (e) {
         setSelectedFiles((prev) => prev.map((f) => (f.tempId === tempId ? { ...f, status: "error", errorMsg: e.message } : f)));
       }
     });
   };
 
-  const removeSelected = (tempId) => setSelectedFiles((prev) => prev.filter((f) => f.tempId !== tempId));
+  const removeSelected = (tempId) => setSelectedFiles((prev) => {
+    const target = prev.find((f) => f.tempId === tempId);
+    if (target && target.previewUrl) URL.revokeObjectURL(target.previewUrl);
+    return prev.filter((f) => f.tempId !== tempId);
+  });
 
   const readyFiles = selectedFiles.filter((f) => f.status === "ready");
 
-  const handleUpload = async () => {
+  // andAnalyze=trueの場合（「保存してGemini分析」）は、保存後この取り込みモーダルを閉じて
+  // プレビュー画面（Gemini分析ボタン群がある画面）を開く。andAnalyze=false（「保存のみ」）は
+  // 従来通りこのモーダルを開いたまま完了メッセージだけ表示する。
+  const handleUpload = async (andAnalyze) => {
     if (!date) { setStatus("対象日を選択してください。"); return; }
     if (!readyFiles.length) { setStatus("ファイルを選択してください。"); return; }
     setUploading(true);
@@ -1661,11 +1911,18 @@ function MonitorImportModal({ onClose, defaultDate, onUploaded }) {
       for (const f of readyFiles) {
         await monitorSaveFile(date, genMonitorFileId(), f.file);
       }
-      setStatus(`${date} に${readyFiles.length}枚保存しました（データ入力画面のカレンダーからプレビューできます）。`);
+      readyFiles.forEach((f) => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+      const savedDate = date;
+      const savedCount = readyFiles.length;
       setSelectedFiles([]);
       if (fileRef.current) fileRef.current.value = "";
       if (cameraRef.current) cameraRef.current.value = "";
       onUploaded();
+      if (andAnalyze) {
+        onSavedAndAnalyze(savedDate);
+      } else {
+        setStatus(`${savedDate} に${savedCount}枚保存しました（データ入力画面のカレンダーからプレビューできます）。`);
+      }
     } catch (e) {
       setStatus("保存エラー: " + e.message);
     } finally {
@@ -1674,19 +1931,94 @@ function MonitorImportModal({ onClose, defaultDate, onUploaded }) {
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+    <section className="monitor-import-panel">
         <h3>中央監視画面取り込み</h3>
         <p className="modal-note">
           中央監視装置の熱源画面（PDF・JPEG・PNG、複数可）を日付ごとに取り込みます。画像は自動的に
           圧縮・縮小されてから保存されます。
           {monitorSyncEnabled ? "Firebaseに保存され、他端末とも共有されます。" : "この端末（ブラウザ）内にのみ保存されます。"}
-          「データ入力」画面のカレンダーからプレビューできます。
         </p>
         <div className="form-row">
           <label>対象日</label>
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          <input type="date" value={date} onChange={(e) => pickDate(e.target.value)} />
         </div>
+
+        {selectedFiles.length === 0 && (
+          <React.Fragment>
+            <div className="monitor-import-cal">
+              <div className="monitor-import-cal-header">
+                <button className="btn btn-small" onClick={() => shiftCalMonth(-1)}>◀ 前月</button>
+                <div>{calY}年{calM}月</div>
+                <button className="btn btn-small" onClick={() => shiftCalMonth(1)}>翌月 ▶</button>
+              </div>
+              <div className="monitor-import-cal-grid monitor-import-cal-dow">
+                {["日", "月", "火", "水", "木", "金", "土"].map((w) => <div key={w}>{w}</div>)}
+              </div>
+              <div className="monitor-import-cal-grid">
+                {calCells.map((d, i) => (
+                  d ? (
+                    <button
+                      key={d}
+                      className={"monitor-import-cal-cell" + (d === date ? " selected" : "")}
+                      onClick={() => pickDate(d)}
+                    >
+                      {Number(d.slice(-2))}
+                      {monitorDateSet.has(d) && <span className="monitor-import-cal-dot">🖥</span>}
+                    </button>
+                  ) : <div key={"empty" + i} className="monitor-import-cal-cell empty"></div>
+                ))}
+              </div>
+            </div>
+
+            <div className="monitor-import-saved-list">
+              <div className="monitor-import-saved-list-title">画面を保存した日（{savedDatesList.length}日）</div>
+              {savedDatesList.length === 0 ? (
+                <div className="modal-note">まだ登録がありません。</div>
+              ) : (
+                <div className="monitor-import-saved-list-items">
+                  {savedDatesList.map((s) => (
+                    <button
+                      key={s.date}
+                      className={"monitor-import-saved-list-item" + (s.date === date ? " selected" : "")}
+                      onClick={() => pickDate(s.date)}
+                    >
+                      {s.date}{s.count > 1 && ` (${s.count}件)`}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {existingFilesForDate.length > 0 && (
+              <div className="monitor-import-existing">
+                <p className="modal-note">この日にはすでに{existingFilesForDate.length}件登録されています（クリックして開く）：</p>
+                <div className="monitor-preview-list">
+                  {existingFilesForDate.map((f) => (
+                    <div
+                      key={f.fileId}
+                      className="monitor-preview-item monitor-preview-item-clickable"
+                      onClick={() => onOpenExistingPreview && onOpenExistingPreview(date)}
+                    >
+                      <div className="monitor-preview-item-thumb">
+                        {existingPreviews[f.fileId] && (
+                          f.fileType === "application/pdf" ? (
+                            <iframe src={existingPreviews[f.fileId]} className="monitor-preview-item-pdf" title={f.fileName}></iframe>
+                          ) : (
+                            <img src={existingPreviews[f.fileId]} alt={f.fileName} />
+                          )
+                        )}
+                      </div>
+                      <div className="monitor-preview-item-info">
+                        <div className="monitor-preview-item-name">{f.fileName}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </React.Fragment>
+        )}
+
         <div
           className={"monitor-dropzone" + (dragOver ? " drag-over" : "")}
           onClick={() => fileRef.current && fileRef.current.click()}
@@ -1708,21 +2040,10 @@ function MonitorImportModal({ onClose, defaultDate, onUploaded }) {
             onChange={(e) => { acceptFiles(e.target.files); e.target.value = ""; }}
           />
         </div>
-        {selectedFiles.length > 0 && (
-          <ul className="monitor-selected-list">
-            {selectedFiles.map((f) => (
-              <li key={f.tempId}>
-                <span>{f.file.name}</span>
-                {f.status === "compressing" && <span className="monitor-selected-status"> 圧縮中…</span>}
-                {f.status === "ready" && <span className="monitor-selected-status">（{Math.round(f.file.size / 1024)}KB）</span>}
-                {f.status === "error" && <span className="monitor-selected-status error"> ⚠ {f.errorMsg}</span>}
-                <button className="btn btn-small" onClick={() => removeSelected(f.tempId)}>×</button>
-              </li>
-            ))}
-          </ul>
-        )}
         <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
-          <button className="btn" onClick={(e) => { e.stopPropagation(); cameraRef.current && cameraRef.current.click(); }}>📷 カメラで撮影</button>
+          <button className="btn" onClick={(e) => { e.stopPropagation(); cameraRef.current && cameraRef.current.click(); }}>
+            {selectedFiles.length > 0 ? "📷 続けてカメラ撮影する" : "📷 カメラで撮影"}
+          </button>
           <input
             type="file"
             ref={cameraRef}
@@ -1732,17 +2053,48 @@ function MonitorImportModal({ onClose, defaultDate, onUploaded }) {
             onChange={(e) => { acceptFiles(e.target.files); e.target.value = ""; }}
           />
         </div>
-        <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
-          <button className="btn btn-primary" onClick={handleUpload} disabled={uploading}>
-            {uploading ? "保存中…" : `保存${readyFiles.length > 0 ? `（${readyFiles.length}枚）` : ""}`}
-          </button>
-        </div>
+
+        {selectedFiles.length > 0 && (
+          <div className="monitor-import-preview-step">
+            <p className="modal-note">この画像で保存しますか？（対象日: {date}）</p>
+            <div className="monitor-preview-list monitor-preview-list-large">
+              {selectedFiles.map((f) => (
+                <div key={f.tempId} className="monitor-preview-item">
+                  <div className="monitor-preview-item-thumb">
+                    {f.status === "ready" && f.previewUrl && (
+                      f.file.type === "application/pdf" ? (
+                        <iframe src={f.previewUrl} className="monitor-preview-item-pdf" title={f.file.name}></iframe>
+                      ) : (
+                        <img src={f.previewUrl} alt={f.file.name} />
+                      )
+                    )}
+                    {f.status === "compressing" && <div className="monitor-preview-item-loading">圧縮中…</div>}
+                    {f.status === "error" && <div className="monitor-preview-item-error">⚠</div>}
+                  </div>
+                  <div className="monitor-preview-item-info">
+                    <div className="monitor-preview-item-name">{f.file.name}</div>
+                    {f.status === "ready" && <div className="monitor-selected-status">{Math.round(f.file.size / 1024)}KB</div>}
+                    {f.status === "error" && <div className="monitor-selected-status error">{f.errorMsg}</div>}
+                    <button className="btn btn-small" onClick={() => removeSelected(f.tempId)}>× 削除</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
+              <button className="btn btn-primary" onClick={() => handleUpload(false)} disabled={uploading || readyFiles.length === 0}>
+                {uploading ? "保存中…" : `保存のみ${readyFiles.length > 0 ? `（${readyFiles.length}枚）` : ""}`}
+              </button>
+              <button className="btn" onClick={() => handleUpload(true)} disabled={uploading || readyFiles.length === 0}>
+                {uploading ? "保存中…" : "🤖 保存してGeminiで分析"}
+              </button>
+            </div>
+          </div>
+        )}
         {status && <div className="modal-status">{status}</div>}
         <div className="modal-actions">
           <button className="btn" onClick={onClose}>閉じる</button>
         </div>
-      </div>
-    </div>
+    </section>
   );
 }
 
@@ -1779,11 +2131,44 @@ function MonitorFilesListModal({ files, onClose, onPreview, onDelete }) {
 
 // 1日に複数の中央監視画面が登録されている場合、まとめてプレビューし、画面ごとの個別分析と
 // 全画面を踏まえた総括の両方をGeminiに依頼できるようにしている。
-function MonitorPreviewModal({ date, files, onClose, onDelete }) {
+// 最適運転アドバイスに付随するLOAD_TABLEをHTMLの表として描画する。
+function LoadTableView({ table }) {
+  if (!table || !table.length) return null;
+  return (
+    <div className="entry-list-scroll" style={{ marginTop: 6 }}>
+      <table className="entry-list-table load-table">
+        <thead>
+          <tr>
+            <th className="entry-list-datecol">機器</th>
+            <th>出力(kW)</th>
+            <th>定格(kW)</th>
+            <th>負荷率(%)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table.map((row, i) => (
+            <tr key={i}>
+              <td className="entry-list-datecol">{row.name || "-"}</td>
+              <td>{row.outputKW != null ? fmtNum(row.outputKW, 0) : "-"}</td>
+              <td>{row.capacityKW != null ? fmtNum(row.capacityKW, 0) : "-"}</td>
+              <td>{row.loadPct != null ? fmtNum(row.loadPct, 1) : "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MonitorPreviewModal({ date, files, settings, onClose, onDelete }) {
   const [previews, setPreviews] = useState({}); // fileId -> { url, status }
   const [fileComments, setFileComments] = useState({}); // fileId -> { status, comment }
+  const [adviceState, setAdviceState] = useState({}); // fileId -> { status, comment }
   const [summaryStatus, setSummaryStatus] = useState("idle"); // idle | loading | done | error
   const [summaryComment, setSummaryComment] = useState("");
+  const [multiAdviceStatus, setMultiAdviceStatus] = useState("idle"); // idle | loading | done | error
+  const [multiAdviceComment, setMultiAdviceComment] = useState("");
+  const [multiAdviceTable, setMultiAdviceTable] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -1792,6 +2177,9 @@ function MonitorPreviewModal({ date, files, onClose, onDelete }) {
     setFileComments({});
     setSummaryStatus("idle");
     setSummaryComment("");
+    setMultiAdviceStatus("idle");
+    setMultiAdviceComment("");
+    setMultiAdviceTable(null);
     files.forEach((f) => {
       setPreviews((prev) => ({ ...prev, [f.fileId]: { url: null, status: "読み込み中…" } }));
       monitorGetPreviewSrc(date, f.fileId).then((result) => {
@@ -1821,6 +2209,19 @@ function MonitorPreviewModal({ date, files, onClose, onDelete }) {
     }
   };
 
+  const analyzeOptimalOperation = async (f) => {
+    setAdviceState((prev) => ({ ...prev, [f.fileId]: { status: "loading", comment: "", table: null } }));
+    try {
+      const dataUrl = await monitorGetFileDataUrl(date, f.fileId);
+      if (!dataUrl) throw new Error("画像データが見つかりませんでした。");
+      const raw = await fetchGeminiImageComment(buildOptimalOperationPrompt(date, f.fileName, settings), dataUrl, f.fileType);
+      const { comment, table } = parseLoadTable(raw);
+      setAdviceState((prev) => ({ ...prev, [f.fileId]: { status: "done", comment, table } }));
+    } catch (e) {
+      setAdviceState((prev) => ({ ...prev, [f.fileId]: { status: "error", comment: e.message, table: null } }));
+    }
+  };
+
   const handleSummarize = async () => {
     setSummaryStatus("loading");
     try {
@@ -1836,6 +2237,29 @@ function MonitorPreviewModal({ date, files, onClose, onDelete }) {
     } catch (e) {
       setSummaryComment(e.message);
       setSummaryStatus("error");
+    }
+  };
+
+  // 全画像を1回のGemini呼び出しでまとめて渡し、画面をまたいだ機器も含めて横断的に
+  // 最適運転アドバイスをもらう（監視画面が1枚に収まらない場合など）。
+  const handleMultiAdvice = async () => {
+    setMultiAdviceStatus("loading");
+    try {
+      const images = [];
+      for (const f of files) {
+        const dataUrl = await monitorGetFileDataUrl(date, f.fileId);
+        if (dataUrl) images.push({ dataUrl, mimeType: f.fileType });
+      }
+      if (!images.length) throw new Error("画像データが見つかりませんでした。");
+      const raw = await fetchGeminiMultiImageComment(buildOptimalOperationMultiPrompt(date, files.map((f) => f.fileName), settings), images);
+      const { comment, table } = parseLoadTable(raw);
+      setMultiAdviceComment(comment);
+      setMultiAdviceTable(table);
+      setMultiAdviceStatus("done");
+    } catch (e) {
+      setMultiAdviceComment(e.message);
+      setMultiAdviceTable(null);
+      setMultiAdviceStatus("error");
     }
   };
 
@@ -1856,17 +2280,29 @@ function MonitorPreviewModal({ date, files, onClose, onDelete }) {
                 {summaryStatus === "error" ? "⚠ " : "📋 "}{summaryComment}
               </p>
             )}
+            <button className="btn btn-small" onClick={handleMultiAdvice} disabled={multiAdviceStatus === "loading"} style={{ marginTop: 8 }}>
+              {multiAdviceStatus === "loading" ? "🤖 提案作成中…" : "🤖 最適運転アドバイス（全画面まとめて）"}
+            </button>
+            {multiAdviceComment && (
+              <p className={"analysis-note ai-comment" + (multiAdviceStatus === "error" ? " ai-comment-error" : "")}>
+                {multiAdviceStatus === "error" ? "⚠ " : "💡 "}{multiAdviceComment}
+              </p>
+            )}
+            <LoadTableView table={multiAdviceTable} />
           </div>
         )}
         {files.map((f) => {
           const preview = previews[f.fileId] || {};
           const aiState = fileComments[f.fileId] || { status: "idle", comment: "" };
+          const advice = adviceState[f.fileId] || { status: "idle", comment: "", table: null };
           return (
             <div key={f.fileId} className="monitor-file-card">
               <div className="monitor-file-card-header">
                 <div className="panel-title">{f.fileName}</div>
-                {preview.url && <a className="btn btn-small" href={preview.url} download={f.fileName} target="_blank" rel="noreferrer">ダウンロード</a>}
-                <button className="btn btn-small btn-ghost-red" onClick={() => onDelete(date, f.fileId)}>削除</button>
+                <div className="monitor-file-card-actions">
+                  {preview.url && <a className="btn btn-small" href={preview.url} download={f.fileName} target="_blank" rel="noreferrer">ダウンロード</a>}
+                  <button className="btn btn-small btn-ghost-red" onClick={() => onDelete(date, f.fileId)}>削除</button>
+                </div>
               </div>
               <div className="monitor-preview-body">
                 {preview.status && <div className="analysis-empty">{preview.status}</div>}
@@ -1879,14 +2315,24 @@ function MonitorPreviewModal({ date, files, onClose, onDelete }) {
               </div>
               {preview.url && (
                 <div className="ai-gemini-box monitor-ai-box">
-                  <button className="btn btn-small" onClick={() => analyzeOneFile(f)} disabled={aiState.status === "loading"}>
-                    {aiState.status === "loading" ? "🤖 画像分析中…" : "🤖 Geminiで画像分析"}
+                  <button
+                    className="btn btn-small"
+                    onClick={() => { analyzeOneFile(f); analyzeOptimalOperation(f); }}
+                    disabled={aiState.status === "loading" || advice.status === "loading"}
+                  >
+                    {(aiState.status === "loading" || advice.status === "loading") ? "🤖 分析中…" : "🤖 Geminiで分析"}
                   </button>
                   {aiState.comment && (
                     <p className={"analysis-note ai-comment" + (aiState.status === "error" ? " ai-comment-error" : "")}>
                       {aiState.status === "error" ? "⚠ " : "🤖 "}{aiState.comment}
                     </p>
                   )}
+                  {advice.comment && (
+                    <p className={"analysis-note ai-comment" + (advice.status === "error" ? " ai-comment-error" : "")}>
+                      {advice.status === "error" ? "⚠ " : "💡 "}{advice.comment}
+                    </p>
+                  )}
+                  <LoadTableView table={advice.table} />
                 </div>
               )}
             </div>
@@ -1912,11 +2358,12 @@ function GranularityToggle({ value, onChange }) {
   );
 }
 
-function AiCommentBox({ buildPrompt, onAddChart }) {
+function AiCommentBox({ buildPrompt, onAddChart, autoRunKey }) {
   const [status, setStatus] = useState("idle"); // idle | loading | done | error
   const [comment, setComment] = useState("");
   const [suggestedKeys, setSuggestedKeys] = useState(null);
   const [chartAdded, setChartAdded] = useState(false);
+  const lastAutoRunKeyRef = useRef(null);
 
   const handleClick = async () => {
     setStatus("loading");
@@ -1944,6 +2391,15 @@ function AiCommentBox({ buildPrompt, onAddChart }) {
     setChartAdded(true);
   };
 
+  // ダッシュボードの注意事項バナーから「分析で詳しく見る」を選んだ場合など、外部から
+  // 指定されたキーが新しく届いたときだけ自動的に分析を実行する（同じキーでは再実行しない）。
+  useEffect(() => {
+    if (autoRunKey == null || lastAutoRunKeyRef.current === autoRunKey) return;
+    lastAutoRunKeyRef.current = autoRunKey;
+    handleClick();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRunKey]);
+
   return (
     <div className="ai-gemini-box">
       <button className="btn btn-small" onClick={handleClick} disabled={status === "loading"}>
@@ -1965,10 +2421,28 @@ function AiCommentBox({ buildPrompt, onAddChart }) {
   );
 }
 
-function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
+function AnalysisView({ data, settings, darkMode, notes, onSaveNote, focus }) {
   const fiscalYears = useMemo(() => Array.from(new Set(data.map((r) => fiscalYear(r.date)))).sort((a, b) => a - b), [data]);
   const [fy, setFy] = useState(() => fiscalYears[fiscalYears.length - 1]);
   const [anomalyMetric, setAnomalyMetric] = useState("elecKWh");
+  const anomalyPanelRef = useRef(null);
+  const demandPanelRef = useRef(null);
+  const handledFocusTokenRef = useRef(null);
+
+  // ダッシュボードの注意事項バナーから「分析で詳しく見る」で来た場合、該当する項目
+  // （異常値検知パネルなら該当metric、デマンド超過ならデマンドパネル）までスクロールする。
+  useEffect(() => {
+    if (!focus || !focus.token || handledFocusTokenRef.current === focus.token) return;
+    if (focus.type === "anomaly" && focus.metric && anomalyMetric !== focus.metric) {
+      setAnomalyMetric(focus.metric);
+      return; // anomalyMetricが更新された次のレンダーで再度この副作用が走る
+    }
+    handledFocusTokenRef.current = focus.token;
+    const targetRef = focus.type === "anomaly" ? anomalyPanelRef : demandPanelRef;
+    requestAnimationFrame(() => {
+      if (targetRef.current) targetRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [focus, anomalyMetric]);
   const [heatmapMetric, setHeatmapMetric] = useState("elecKWh");
   const [overlayMetric, setOverlayMetric] = useState("elecKWh");
   const [overlayYears, setOverlayYears] = useState(() => fiscalYears.slice(-3));
@@ -1977,6 +2451,7 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
   const [intensityGranularity, setIntensityGranularity] = useState("month");
   const [co2Granularity, setCo2Granularity] = useState("month");
   const [demandGranularity, setDemandGranularity] = useState("day");
+  const [compareDate, setCompareDate] = useState(() => (data.length ? data[data.length - 1].date : ""));
 
   const monthKeys = useMemo(() => fiscalMonthKeys(fy), [fy]);
   const fyRows = useMemo(() => data.filter((r) => fiscalYear(r.date) === fy), [data, fy]);
@@ -1984,6 +2459,30 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
   const monthlyRows = useMemo(() => monthKeys.map((ym) => data.filter((r) => r.date.startsWith(ym))), [data, monthKeys]);
   const prevMonthlyRows = useMemo(() => fiscalMonthKeys(fy - 1).map((ym) => data.filter((r) => r.date.startsWith(ym))), [data, fy]);
   const byDate = useMemo(() => { const m = {}; data.forEach((r) => { m[r.date] = r; }); return m; }, [data]);
+
+  // 12. 日付比較分析：選択した日付を基準に、前日・前週・前月・前年の同項目と比較する
+  const dateCompare = useMemo(() => {
+    if (!compareDate) return null;
+    const baseRow = byDate[compareDate] || null;
+    const periods = [
+      { key: "prevDay", label: "前日", date: addDays(compareDate, -1) },
+      { key: "prevWeek", label: "前週", date: addDays(compareDate, -7) },
+      { key: "prevMonth", label: "前月", date: addMonthsClamped(compareDate, -1) },
+      { key: "prevYear", label: "前年", date: addMonthsClamped(compareDate, -12) },
+    ];
+    const rows = DASHBOARD_KPI_KEYS.map((key) => {
+      const meta = METRICS[key];
+      const baseVal = baseRow && baseRow[key] != null && !isNaN(baseRow[key]) ? baseRow[key] : null;
+      const comps = periods.map((p) => {
+        const cmpRow = byDate[p.date];
+        const cmpVal = cmpRow && cmpRow[key] != null && !isNaN(cmpRow[key]) ? cmpRow[key] : null;
+        const pct = baseVal != null && cmpVal != null && cmpVal !== 0 ? ((baseVal - cmpVal) / cmpVal) * 100 : null;
+        return { ...p, value: cmpVal, pct };
+      });
+      return { key, label: meta.label, unit: meta.unit, baseValue: baseVal, comps };
+    });
+    return { baseRow, periods, rows };
+  }, [compareDate, byDate]);
 
   // グラフごとの日/月/年切替：選択中の年度内の日次、年度内の月次、または全年度の年次で束ねる
   const granularityData = (gran) => {
@@ -2351,7 +2850,7 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
           `電力原単位(kWh/GJ): ${seriesText(intensityData.labels, intensityData.elec, "")}\n重油原単位(L/GJ): ${seriesText(intensityData.labels, intensityData.oil, "")}`)} />
       </section>
 
-      <section className="chart-panel">
+      <section className="chart-panel" ref={anomalyPanelRef}>
         <div className="panel-title-row">
           <div className="panel-title">2. 異常値検知（気温回帰モデルから±{fmtNum(settings.anomalySigmaThreshold, 1)}σ以上乖離した日）</div>
           <select className="chart-header-select" value={anomalyMetric} onChange={(e) => setAnomalyMetric(e.target.value)}>
@@ -2360,7 +2859,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         </div>
         <p className="analysis-note">全期間データで「外気温度→{anomaly.meta.label}」の回帰モデルを作り、予測から大きく外れた日を検出します（設備異常・誤記録の早期発見用）。</p>
         <p className="analysis-note ai-comment">💬 {anomalyComment}</p>
-        <AiCommentBox buildPrompt={() => buildAnalysisPrompt(`異常値検知（${anomaly.meta.label}）`,
+        <AiCommentBox
+          autoRunKey={focus && focus.type === "anomaly" && focus.metric === anomalyMetric ? focus.token : null}
+          buildPrompt={() => buildAnalysisPrompt(`異常値検知（${anomaly.meta.label}）`,
           anomaly.list.length === 0 ? "異常日は検出されていません。"
             : anomaly.list.slice(0, 5).map((x) => `${x.date}: 実績${fmtNum(x.actual, 0)}${anomaly.meta.unit}, 回帰予測${fmtNum(x.pred, 0)}${anomaly.meta.unit}, 乖離${fmtNum(x.sigma, 1)}σ`).join("\n"))} />
         {anomaly.list.length === 0 ? (
@@ -2373,8 +2874,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
                 const noteMsg = `異常値検知: ${anomaly.meta.label} ${fmtNum(x.actual, 0)}${anomaly.meta.unit}（回帰予測比 ${x.sigma > 0 ? "+" : ""}${fmtNum(x.sigma, 1)}σ）`;
                 const existing = notes && notes[x.date];
                 const alreadyRecorded = existing && existing.includes(noteMsg);
+                const isFocused = focus && focus.type === "anomaly" && focus.metric === anomalyMetric && focus.date === x.date;
                 return (
-                  <tr key={x.date}>
+                  <tr key={x.date} className={isFocused ? "row-focused" : ""}>
                     <td>{x.date}</td>
                     <td>{fmtNum(x.temp, 1)}℃</td>
                     <td>{fmtNum(x.actual, 0)} {anomaly.meta.unit}</td>
@@ -2483,7 +2985,7 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
         <AiCommentBox buildPrompt={() => buildAnalysisPrompt("CO2排出量トレンド", seriesText(co2Data.labels, co2Data.current, "t-CO2"))} />
       </section>
 
-      <section className="chart-panel">
+      <section className="chart-panel" ref={demandPanelRef}>
         <div className="panel-title-row">
           <div className="panel-title">7. デマンド分析（日平均電力と契約電力）</div>
           <GranularityToggle value={demandGranularity} onChange={setDemandGranularity} />
@@ -2499,7 +3001,9 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
           <ChartCanvas key={`dem-${fy}-${demandGranularity}-${darkMode}`} getConfig={demandConfig} />
         </div>
         <p className="analysis-note ai-comment">💬 {demandComment}</p>
-        <AiCommentBox buildPrompt={() => buildAnalysisPrompt("デマンド分析（日平均電力）",
+        <AiCommentBox
+          autoRunKey={focus && focus.type === "demand" ? focus.token : null}
+          buildPrompt={() => buildAnalysisPrompt("デマンド分析（日平均電力）",
           seriesText(demandData.labels, demandData.values, "kW") + `\n契約電力: ${fmtNum(settings.contractKW, 0)}kW`)} />
         <div className="panel-title" style={{ marginTop: 16 }}>契約電力比の分布（日数）</div>
         <div className="chart-canvas-toolbar">
@@ -2622,6 +3126,58 @@ function AnalysisView({ data, settings, darkMode, notes, onSaveNote }) {
               </React.Fragment>
             );
           })
+        )}
+      </section>
+
+      <section className="chart-panel">
+        <div className="panel-title">12. 日付比較分析（前日・前週・前月・前年）</div>
+        <div className="form-row">
+          <label>比較する日付</label>
+          <input type="date" value={compareDate} onChange={(e) => setCompareDate(e.target.value)} />
+        </div>
+        {!dateCompare || !dateCompare.baseRow ? (
+          <div className="analysis-empty">選択した日付の実績データがありません。</div>
+        ) : (
+          <div className="entry-list-scroll">
+            <table className="entry-list-table compare-table">
+              <thead>
+                <tr>
+                  <th className="entry-list-datecol">項目</th>
+                  <th>{compareDate}<br /><span className="entry-list-unit">基準日</span></th>
+                  {dateCompare.periods.map((p) => (
+                    <th key={p.key}>{p.label}<br /><span className="entry-list-unit">{p.date}</span></th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {dateCompare.rows.map((r) => (
+                  <tr key={r.key}>
+                    <td className="entry-list-datecol">{r.label}</td>
+                    <td>{r.baseValue != null ? `${fmtNum(r.baseValue, Math.abs(r.baseValue) < 100 ? 1 : 0)} ${r.unit}` : "-"}</td>
+                    {r.comps.map((c) => (
+                      <td key={c.key}>
+                        {c.value != null ? (
+                          <React.Fragment>
+                            {fmtNum(c.value, Math.abs(c.value) < 100 ? 1 : 0)} {r.unit}
+                            {c.pct != null && (
+                              <React.Fragment><br /><span className={"kpi-delta " + (c.pct > 0 ? "up" : c.pct < 0 ? "down" : "")}>{fmtPct(c.pct)}</span></React.Fragment>
+                            )}
+                          </React.Fragment>
+                        ) : "データなし"}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {dateCompare && dateCompare.baseRow && (
+          <AiCommentBox buildPrompt={() => buildAnalysisPrompt(
+            `${compareDate}の各項目比較（前日・前週・前月・前年）`,
+            dateCompare.rows.map((r) => `${r.label}: 基準日${fmtNum(r.baseValue, 1)}${r.unit}`
+              + r.comps.map((c) => `／${c.label}比${c.pct != null ? fmtPct(c.pct) : "データなし"}`).join("")).join("\n")
+          )} />
         )}
       </section>
     </div>
@@ -2754,6 +3310,11 @@ function App() {
   const [showMonitorImport, setShowMonitorImport] = useState(false);
   const [monitorFiles, setMonitorFiles] = useState([]);
   const [monitorTick, setMonitorTick] = useState(0);
+  const [previewMonitorDate, setPreviewMonitorDate] = useState(null);
+  const previewMonitorFiles = useMemo(
+    () => (previewMonitorDate ? monitorFiles.filter((f) => f.date === previewMonitorDate) : []),
+    [monitorFiles, previewMonitorDate]
+  );
 
   // 中央監視画面の一覧：Firebase同期が有効ならリアルタイム購読、そうでなければ
   // IndexedDBから読み込む（monitorTickが変わるたびに再読み込み）。1日に複数ファイルを
@@ -2802,8 +3363,8 @@ function App() {
   const [fullscreenChartId, setFullscreenChartId] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showDataUpdate, setShowDataUpdate] = useState(false);
-  const [showReportPreview, setShowReportPreview] = useState(false);
   const [mode, setMode] = useState(() => (savedViewState && savedViewState.mode) || "dashboard");
+  const [analysisFocus, setAnalysisFocus] = useState(null); // { type: "anomaly"|"demand", metric?, token }
   const [darkMode, setDarkMode] = useState(() => { try { return localStorage.getItem(LS_DARKMODE_KEY) === "1"; } catch (e) { return false; } });
 
   const latestDate = data.length ? data[data.length - 1].date : null;
@@ -2825,7 +3386,7 @@ function App() {
     const demandThreshold = (settings.demandAlertPct || 100) / 100;
     recent.forEach((r) => {
       if (settings.contractKW > 0 && r.demandKW != null && r.demandKW / settings.contractKW >= demandThreshold) {
-        alerts.push({ key: `demand-${r.date}`, date: r.date, message: `${r.date}: 日平均電力が契約比${fmtNum(settings.demandAlertPct, 0)}%を超過（契約比${fmtNum((r.demandKW / settings.contractKW) * 100, 0)}%）` });
+        alerts.push({ key: `demand-${r.date}`, date: r.date, type: "demand", message: `${r.date}: 日平均電力が契約比${fmtNum(settings.demandAlertPct, 0)}%を超過（契約比${fmtNum((r.demandKW / settings.contractKW) * 100, 0)}%）` });
       }
     });
     const sigmaThreshold = settings.anomalySigmaThreshold || 2;
@@ -2844,6 +3405,8 @@ function App() {
           alerts.push({
             key: `anomaly-${metricKey}-${r.date}`,
             date: r.date,
+            type: "anomaly",
+            metricKey,
             message: `${r.date}: ${METRICS[metricKey].label}が気温からの予測より${sigma > 0 ? "大幅に多い" : "大幅に少ない"}（${sigma > 0 ? "+" : ""}${fmtNum(sigma, 1)}σ）`,
           });
         }
@@ -3148,20 +3711,23 @@ function App() {
     const co2 = (sumMetric(kpiCurrentRows, "elecKWh") * settings.elecCO2PerKWh + sumMetric(kpiCurrentRows, "oilTotalL") * settings.oilCO2PerL) / 1000;
     const crudeOilKL = settings.crudeOilGJperKL > 0 ? inputGJ / settings.crudeOilGJperKL : null;
     const costYen = sumMetric(kpiCurrentRows, "elecKWh") * settings.elecPricePerKWh + sumMetric(kpiCurrentRows, "oilTotalL") * settings.oilPricePerL;
-    return { inputGJ, loadGJ, ratio: inputGJ > 0 ? (loadGJ / inputGJ) * 100 : null, co2, crudeOilKL, costYen };
-  }, [kpiCurrentRows, settings]);
+    const totalRatedCapacityKW = (settings.chiller1CapacityKW || 0) + (settings.chiller2CapacityKW || 0)
+      + (settings.boiler1CapacityKW || 0) + (settings.boiler2CapacityKW || 0);
+    const maxCapacityGJ = totalRatedCapacityKW * 24 * 0.0036 * periodDays;
+    const equipUtilPct = maxCapacityGJ > 0 ? (loadGJ / maxCapacityGJ) * 100 : null;
+    return { inputGJ, loadGJ, ratio: inputGJ > 0 ? (loadGJ / inputGJ) * 100 : null, co2, crudeOilKL, costYen, equipUtilPct };
+  }, [kpiCurrentRows, settings, periodDays]);
+
+  const enthalpyStat = useMemo(() => {
+    const cur = avgMetric(kpiCurrentRows, "enthalpyKJkg");
+    const prev = kpiPreviousRows.length ? avgMetric(kpiPreviousRows, "enthalpyKJkg") : null;
+    const pct = prev != null && prev !== 0 ? ((cur - prev) / prev) * 100 : null;
+    return { current: cur, previous: prev, pct };
+  }, [kpiCurrentRows, kpiPreviousRows]);
 
   return (
-    <div className={"app-shell" + (showReportPreview ? " report-preview" : "")} data-theme={darkMode ? "dark" : "light"}>
-      {showReportPreview && (
-        <div className="report-preview-bar no-print">
-          <span>📄 レポートプレビュー表示中（この内容が印刷/PDF化されます）</span>
-          <div className="report-preview-actions">
-            <button className="btn btn-primary" onClick={() => window.print()}>🖨 印刷する</button>
-            <button className="btn btn-ghost" onClick={() => setShowReportPreview(false)}>✕ プレビューを閉じる</button>
-          </div>
-        </div>
-      )}
+    <div className="app-shell" data-theme={darkMode ? "dark" : "light"}>
+      <div className="app-sticky-top">
       <header className="app-header">
         <div className="app-title-row">
           <div className="app-title">エネルギー管理ダッシュボード</div>
@@ -3176,41 +3742,28 @@ function App() {
           </div>
           <button className="btn btn-ghost" onClick={() => setShowDataUpdate(true)}>データ更新</button>
           <button className="btn btn-ghost" onClick={() => setShowMonitorImport(true)}>🖥 中央監視画面取り込み</button>
-          <button className="btn btn-ghost" onClick={() => setShowReportPreview(true)} title="印刷/PDF保存前にレポートのプレビューを表示します">レポート作成(PDF)</button>
           <button className="btn btn-ghost header-settings-btn" onClick={() => setDarkMode((v) => !v)}>{darkMode ? "☀ ライト" : "🌙 ダーク"}</button>
           <button className="btn btn-ghost" onClick={() => setShowSettings(true)}>設定</button>
         </div>
       </header>
 
-      {mode === "entry" && <DataEntryView data={dataDisplay} onSave={handleSaveRecord} onDelete={handleDeleteRecord} notes={notes} onSaveNote={handleSaveNote} monitorFiles={monitorFiles} onDeleteMonitorFile={handleDeleteMonitorFile} />}
-
-      {mode === "analysis" && (data.length ? <AnalysisView data={dataDisplay} settings={settings} darkMode={darkMode} notes={notes} onSaveNote={handleSaveNote} /> : <div className="empty-state">データがありません。</div>)}
-
-      {mode === "dashboard" && !data.length && (
-        <div className="empty-state">データがありません。「データ入力」または「データ更新」から取り込んでください。</div>
-      )}
-
-      {mode === "dashboard" && data.length > 0 && (
-      <React.Fragment>
-      <div className="print-only-header">
-        <div className="print-report-title">エネルギー管理レポート</div>
-        <div className="print-report-meta">対象期間: {kpiLabel} ／ 出力日時: {new Date().toLocaleString("ja-JP")}</div>
-      </div>
-      {dataGaps.length > 0 && (
-        <div className="gap-banner">
-          データ欠落期間の可能性: {dataGaps.map((g, i) => (
-            <span key={i}>{i > 0 && "、"}{g.from} 〜 {g.to}（約{g.days}日分）</span>
-          ))}
-          。元データ（エネルギー.xlsx）をご確認のうえ、必要であれば修正後に「データ更新」から再取込みしてください。
-        </div>
-      )}
-
-      {showAlertBanner && (
-        <div className="alert-banner no-print">
+      {!showMonitorImport && showAlertBanner && (
+        <div className="alert-banner">
           <div className="alert-banner-header">
             <span>⚠ 直近7日で{recentAlerts.length}件の注意事項があります</span>
             <div className="alert-banner-actions">
-              <button className="btn btn-small" onClick={() => setMode("analysis")}>分析で詳しく見る</button>
+              <button
+                className="btn btn-small"
+                onClick={() => {
+                  const first = recentAlerts[0];
+                  if (first) {
+                    setAnalysisFocus({ type: first.type, metric: first.metricKey, date: first.date, token: Date.now() });
+                  }
+                  setMode("analysis");
+                }}
+              >
+                分析で詳しく見る
+              </button>
               <button className="btn btn-small" onClick={() => setDismissedAlertSig(alertSig)}>閉じる</button>
             </div>
           </div>
@@ -3232,6 +3785,38 @@ function App() {
               );
             })}
           </ul>
+        </div>
+      )}
+      </div>
+
+      {showMonitorImport ? (
+        <MonitorImportModal
+          defaultDate={latestDate || new Date().toISOString().slice(0, 10)}
+          onClose={() => setShowMonitorImport(false)}
+          onUploaded={handleUploadedMonitorFile}
+          onSavedAndAnalyze={setPreviewMonitorDate}
+          monitorFiles={monitorFiles}
+          onOpenExistingPreview={setPreviewMonitorDate}
+        />
+      ) : (
+      <React.Fragment>
+
+      {mode === "entry" && <DataEntryView data={dataDisplay} onSave={handleSaveRecord} onDelete={handleDeleteRecord} notes={notes} onSaveNote={handleSaveNote} monitorFiles={monitorFiles} onDeleteMonitorFile={handleDeleteMonitorFile} onOpenMonitorPreview={setPreviewMonitorDate} />}
+
+      {mode === "analysis" && (data.length ? <AnalysisView data={dataDisplay} settings={settings} darkMode={darkMode} notes={notes} onSaveNote={handleSaveNote} focus={analysisFocus} /> : <div className="empty-state">データがありません。</div>)}
+
+      {mode === "dashboard" && !data.length && (
+        <div className="empty-state">データがありません。「データ入力」または「データ更新」から取り込んでください。</div>
+      )}
+
+      {mode === "dashboard" && data.length > 0 && (
+      <React.Fragment>
+      {dataGaps.length > 0 && (
+        <div className="gap-banner">
+          データ欠落期間の可能性: {dataGaps.map((g, i) => (
+            <span key={i}>{i > 0 && "、"}{g.from} 〜 {g.to}（約{g.days}日分）</span>
+          ))}
+          。元データ（エネルギー.xlsx）をご確認のうえ、必要であれば修正後に「データ更新」から再取込みしてください。
         </div>
       )}
 
@@ -3412,6 +3997,11 @@ function App() {
                   active={!!charts[0] && charts[0].selectedMetrics.includes("crudeOilKL")} onClick={() => toggleMetricInFirstChart("crudeOilKL")} />
                 <KPICard label="概算コスト" current={efficiency.costYen} unit="円"
                   active={!!charts[0] && charts[0].selectedMetrics.includes("costYen")} onClick={() => toggleMetricInFirstChart("costYen")} />
+                <KPICard label="比エンタルピー(外気)" current={enthalpyStat.current} previous={enthalpyStat.previous} unit="kJ/kg" pct={enthalpyStat.pct}
+                  active={!!charts[0] && charts[0].selectedMetrics.includes("enthalpyKJkg")} onClick={() => toggleMetricInFirstChart("enthalpyKJkg")} />
+                <KPICard label="設備稼働率(負荷/定格能力)" current={efficiency.equipUtilPct} unit="%"
+                  highlight="⚠ 定格能力は現在仮の数値です（設定画面で編集可能）"
+                  active={!!charts[0] && charts[0].selectedMetrics.includes("equipUtilPct")} onClick={() => toggleMetricInFirstChart("equipUtilPct")} />
               </div>
               {charts[0] && <div className="combined-chart-wrap">{renderChartBody(charts[0], true)}</div>}
               <AiCommentBox
@@ -3461,6 +4051,9 @@ function App() {
       </React.Fragment>
       )}
 
+      </React.Fragment>
+      )}
+
       {showSettings && (
         <SettingsModal
           settings={settings}
@@ -3478,16 +4071,20 @@ function App() {
         />
       )}
       {showDataUpdate && <DataUpdateModal onImport={handleImportData} onClose={() => setShowDataUpdate(false)} />}
-      {showMonitorImport && (
-        <MonitorImportModal
-          defaultDate={latestDate || new Date().toISOString().slice(0, 10)}
-          onClose={() => setShowMonitorImport(false)}
-          onUploaded={handleUploadedMonitorFile}
+      {previewMonitorDate && (
+        <MonitorPreviewModal
+          date={previewMonitorDate}
+          files={previewMonitorFiles}
+          settings={settings}
+          onClose={() => setPreviewMonitorDate(null)}
+          onDelete={handleDeleteMonitorFile}
         />
       )}
 
       <style>{`
         .app-shell { max-width: 1280px; margin: 0 auto; padding: 16px calc(20px + env(safe-area-inset-right)) calc(60px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left)); }
+        .app-sticky-top { position: sticky; top: 0; z-index: 500; background: #f1f5f9; padding-bottom: 6px; }
+        .app-shell[data-theme="dark"] .app-sticky-top { background: #0b1220; }
         .app-header { padding:14px 20px; background:#0f172a; color:#fff; border-radius:12px; margin-bottom:16px; }
         .app-title-row { margin-bottom:12px; display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
         .app-title { font-size:18px; font-weight:700; }
@@ -3608,6 +4205,8 @@ function App() {
         .anomaly-table th, .anomaly-table td { padding:6px 10px; border-bottom:1px solid #f1f5f9; text-align:right; }
         .anomaly-table th:first-child, .anomaly-table td:first-child { text-align:left; }
         .anomaly-table th { color:#94a3b8; font-weight:700; background:#f8fafc; }
+        .anomaly-table tr.row-focused td { background:#fef2f2; }
+        .app-shell[data-theme="dark"] .anomaly-table tr.row-focused td { background:#3f1d1d; }
         .dev-up { color:#dc2626; font-weight:700; }
         .dev-down { color:#2563eb; font-weight:700; }
         .target-row { margin-bottom:14px; }
@@ -3652,16 +4251,57 @@ function App() {
         .monitor-preview-body { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; overflow:auto; background:#f1f5f9; border-radius:8px; margin-top:14px; }
         .monitor-preview-frame { width:100%; height:min(75vh, 900px); border:none; border-radius:8px; }
         .monitor-preview-image { max-width:100%; max-height:75vh; object-fit:contain; }
-        .monitor-selected-list { list-style:none; margin:6px 0 0; padding:0; font-size:13px; }
-        .monitor-selected-list li { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #f1f5f9; }
-        .monitor-selected-status { color:#64748b; font-size:12px; }
+        .monitor-preview-list { display:flex; flex-wrap:wrap; gap:12px; margin-top:10px; }
+        .monitor-preview-item { width:140px; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden; }
+        .monitor-preview-item-thumb { width:100%; height:100px; background:#f1f5f9; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+        .monitor-preview-item-thumb img { width:100%; height:100%; object-fit:contain; }
+        .monitor-preview-item-pdf { width:100%; height:100%; border:none; }
+        .monitor-preview-item-loading, .monitor-preview-item-error { font-size:12px; color:#64748b; }
+        .monitor-preview-item-error { color:#b91c1c; font-size:20px; }
+        .monitor-preview-item-info { padding:6px 8px; font-size:12px; }
+        .monitor-preview-item-name { word-break:break-all; margin-bottom:2px; }
+        .monitor-selected-status { color:#64748b; font-size:12px; display:block; }
         .monitor-selected-status.error { color:#b91c1c; }
         .monitor-file-card { border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-top:14px; }
         .monitor-file-card-header { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:4px; }
+        .monitor-file-card-actions { display:flex; gap:8px; flex-shrink:0; }
+        .monitor-preview-item-clickable { cursor:pointer; transition:box-shadow 0.15s, border-color 0.15s; }
+        .monitor-preview-item-clickable:hover { border-color:#2563eb; box-shadow:0 0 0 2px rgba(37,99,235,0.15); }
+        .monitor-preview-list-large .monitor-preview-item { width:min(320px, 100%); }
+        .monitor-preview-list-large .monitor-preview-item-thumb { height:280px; }
+        .monitor-import-panel { background:#fff; border-radius:12px; padding:20px 24px; margin-bottom:16px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+        .app-shell[data-theme="dark"] .monitor-import-panel { background:#1e293b; }
         .monitor-summary-box { padding:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; margin-bottom:4px; }
         .app-shell[data-theme="dark"] .monitor-file-card { border-color:#334155; }
         .app-shell[data-theme="dark"] .monitor-summary-box { background:#1e293b; border-color:#334155; }
-        .app-shell[data-theme="dark"] .monitor-selected-list li { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-preview-item { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-preview-item-thumb { background:#1e293b; }
+        .monitor-import-cal { margin:10px 0; border:1px solid #e2e8f0; border-radius:10px; padding:8px 10px; width:240px; max-width:100%; }
+        .monitor-import-cal-header { display:flex; align-items:center; justify-content:space-between; font-size:12px; font-weight:700; margin-bottom:4px; gap:4px; }
+        .monitor-import-cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:1px; }
+        .monitor-import-cal-dow { font-size:10px; color:#94a3b8; text-align:center; margin-bottom:2px; }
+        .monitor-import-cal-cell {
+          position:relative; height:26px; border:1px solid transparent; border-radius:5px; background:none;
+          font-size:11px; cursor:pointer; color:#334155;
+        }
+        .monitor-import-cal-cell:hover { background:#f1f5f9; }
+        .monitor-import-cal-cell.selected { background:#2563eb; color:#fff; font-weight:700; }
+        .monitor-import-cal-cell.empty { cursor:default; }
+        .monitor-import-cal-dot { position:absolute; bottom:0; right:1px; font-size:7px; line-height:1; }
+        .monitor-import-existing { margin:10px 0; }
+        .monitor-import-saved-list { margin:10px 0; }
+        .monitor-import-saved-list-title { font-size:13px; font-weight:700; margin-bottom:6px; }
+        .monitor-import-saved-list-items { display:flex; flex-wrap:wrap; gap:6px; max-height:120px; overflow-y:auto; }
+        .monitor-import-saved-list-item { border:1px solid #cbd5e1; background:#fff; border-radius:8px; padding:4px 10px; font-size:12px; cursor:pointer; color:#334155; }
+        .monitor-import-saved-list-item:hover { background:#f1f5f9; }
+        .monitor-import-saved-list-item.selected { background:#2563eb; border-color:#2563eb; color:#fff; }
+        .monitor-import-preview-step { margin-top:10px; padding-top:10px; border-top:1px solid #e2e8f0; }
+        .app-shell[data-theme="dark"] .monitor-import-cal { border-color:#334155; }
+        .app-shell[data-theme="dark"] .monitor-import-cal-cell { color:#e2e8f0; }
+        .app-shell[data-theme="dark"] .monitor-import-cal-cell:hover { background:#1e293b; }
+        .app-shell[data-theme="dark"] .monitor-import-saved-list-item { background:#1e293b; border-color:#334155; color:#e2e8f0; }
+        .app-shell[data-theme="dark"] .monitor-import-saved-list-item:hover { background:#0f172a; }
+        .app-shell[data-theme="dark"] .monitor-import-preview-step { border-color:#334155; }
         .monitor-dropzone {
           border:2px dashed #cbd5e1; border-radius:10px; padding:24px 16px; text-align:center;
           font-size:13px; color:#64748b; cursor:pointer; margin:10px 0; transition:background 0.15s, border-color 0.15s;
@@ -3769,46 +4409,6 @@ function App() {
         .app-shell[data-theme="dark"] .gap-banner { background:#3f2d0d; border-color:#92400e; color:#fde68a; }
         .app-shell[data-theme="dark"] .modal-note { color:#94a3b8; }
 
-        .print-only-header { display:none; }
-        .print-report-title { font-size:20px; font-weight:700; }
-        .print-report-meta { font-size:12px; color:#475569; margin-top:4px; }
-
-        .report-preview-bar {
-          position:sticky; top:0; z-index:500; display:flex; align-items:center; justify-content:space-between;
-          gap:12px; background:#0f172a; color:#fff; padding:10px 16px; border-radius:10px; margin-bottom:16px;
-        }
-        .report-preview-bar span { font-size:13px; }
-        .report-preview-actions { display:flex; gap:8px; }
-
-        /* 画面上でのレポートプレビュー表示（実際の印刷用CSSと同じ内容を画面にも適用） */
-        .app-shell.report-preview .no-print:not(.report-preview-bar),
-        .app-shell.report-preview .app-header-row2, .app-shell.report-preview .tabs,
-        .app-shell.report-preview .gear-btn, .app-shell.report-preview .chart-header-toggle,
-        .app-shell.report-preview .chart-header-select, .app-shell.report-preview .add-chart-btn,
-        .app-shell.report-preview .mode-toggle, .app-shell.report-preview .entry-list-panel,
-        .app-shell.report-preview .day-type-legend, .app-shell.report-preview .chart-canvas-toolbar,
-        .app-shell.report-preview .alert-banner-actions, .app-shell.report-preview .kpi-period-header
-          { display:none !important; }
-        .app-shell.report-preview { background:#fff; }
-        .app-shell.report-preview .app-header { background:#fff; color:#0f172a; box-shadow:none; padding:0 0 8px; }
-        .app-shell.report-preview .print-only-header { display:block; margin-bottom:14px; border-bottom:2px solid #0f172a; padding-bottom:10px; }
-        .app-shell.report-preview .chart-panel, .app-shell.report-preview .kpi-row,
-        .app-shell.report-preview .combined-chart-wrap, .app-shell.report-preview .chart-side-selector
-          { box-shadow:none !important; border:1px solid #cbd5e1; }
-
-        @media print {
-          .no-print, .app-header-row2, .tabs, .gear-btn, .chart-header-toggle, .chart-header-select,
-          .add-chart-btn, .mode-toggle, .entry-list-panel, .day-type-legend, .chart-canvas-toolbar,
-          .alert-banner-actions, .kpi-period-header { display:none !important; }
-          body { background:#fff; }
-          .app-shell { padding:0; max-width:100%; }
-          .app-header { background:#fff; color:#0f172a; border-radius:0; box-shadow:none; padding:0 0 8px; }
-          .print-only-header { display:block; margin-bottom:14px; border-bottom:2px solid #0f172a; padding-bottom:10px; }
-          .gap-banner, .alert-banner { break-inside:avoid; page-break-inside:avoid; }
-          .chart-panel, .kpi-row, .combined-chart-wrap, .chart-side-selector { box-shadow:none !important; border:1px solid #cbd5e1; break-inside:avoid; page-break-inside:avoid; }
-          .kpi-card { break-inside:avoid; }
-          .chart-canvas-wrap { height:260px !important; }
-        }
       `}</style>
     </div>
   );

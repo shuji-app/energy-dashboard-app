@@ -50,6 +50,13 @@ function doPost(e) {
     if (body.imageBase64) {
       parts.push({ inlineData: { mimeType: body.imageMimeType || "image/jpeg", data: body.imageBase64 } });
     }
+    // 複数画像をまとめて渡す場合（app.jsxのfetchGeminiMultiImageComment）は
+    // body.imagesに[{mimeType, data}, ...]の配列が入っているので、それぞれinlineDataパーツにする。
+    if (body.images && body.images.length) {
+      body.images.forEach(function (img) {
+        parts.push({ inlineData: { mimeType: img.mimeType || "image/jpeg", data: img.data } });
+      });
+    }
     var payload = {
       contents: [{ parts: parts }],
     };
